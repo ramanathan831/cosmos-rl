@@ -108,8 +108,10 @@ RUN APEX_CPP_EXT=1 APEX_CUDA_EXT=1 pip install -v --no-build-isolation git+https
 RUN pip install nvidia-nvshmem-cu12==3.4.5
 RUN TORCH_CUDA_ARCH_LIST="8.0 9.0+PTX" pip install git+https://github.com/fanshiqing/grouped_gemm@v1.1.4 --no-build-isolation
 RUN apt-get update && apt-get install -y  libibverbs-dev
+ARG DEEPEP_COMMIT=567632d
 RUN git clone https://github.com/deepseek-ai/DeepEP.git /tmp/deepep \
     && cd /tmp/deepep \
+    && git checkout ${DEEPEP_COMMIT} \
     && python setup.py build \
     && python setup.py install
 
@@ -196,6 +198,9 @@ RUN apt install -y cmake && \
     pip install /workspace/cosmos_rl${COSMOS_RL_EXTRAS:+[$COSMOS_RL_EXTRAS]} && \
     if [[ ",$COSMOS_RL_EXTRAS," == *,vla,* ]]; then \
         bash /workspace/cosmos_rl/tools/scripts/setup_vla.sh; \
+    fi && \
+    if [ -f /workspace/cosmos_rl/tao-core/setup.py ]; then \
+        pip install /workspace/cosmos_rl/tao-core; \
     fi && \
     rm -rf /workspace/cosmos_rl
 RUN pip uninstall -y xformers
