@@ -116,6 +116,10 @@ rl = [
     "flash-attn>=2.8.3",
 ]
 
+tao = [
+    "nvidia-tao-daft>=2.9.1",
+]
+
 all = [
     "cosmos_rl[wfm,vla,rl]",
 ]
