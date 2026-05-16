@@ -13,21 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
 import contextlib
-import torch
-import math
-import numpy
-import os
 import functools
 import inspect
+import math
+import os
+from dataclasses import dataclass
+from typing import Generator, List, Optional
 
-from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
-from typing import Generator, Optional, List
-
-from cosmos_rl.utils.logging import logger
+import numpy
+import torch
 from cosmos_rl.policy.config import ParallelismConfig
+from cosmos_rl.utils.logging import logger
 from functools import lru_cache
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
 
 @lru_cache(maxsize=1)
@@ -48,7 +47,7 @@ def train_context(enable_compiled_autograd: bool):
                 )
 
             if cp_context is not None:
-                from torch.nn.attention import sdpa_kernel, SDPBackend
+                from torch.nn.attention import SDPBackend, sdpa_kernel
 
                 stack.enter_context(
                     sdpa_kernel(
@@ -90,7 +89,10 @@ class ParallelDims:
     tp: int
     pp: int
     world_size: int
-    pp_dynamic_shape: bool
+    pp_dynamic_shape: bool = False
+    pp_micro_batch_size: int = 1
+    pp_schedule: str = "Interleaved1F1B"
+    pp_layers_per_stage: int = 2
     enable_loss_parallel: bool = False
     ep: int = 1
     # When ep is enabled, we can have different dp shard for the MoE module.
@@ -100,29 +102,37 @@ class ParallelDims:
     dp_shard_with_ep: int = -1
 
     @staticmethod
-    def from_config(parallesim_config: ParallelismConfig):
+    def from_config(parallelism_config: ParallelismConfig):
         return ParallelDims(
-            dp_replicate=parallesim_config.dp_replicate_size,
-            dp_shard=parallesim_config.dp_shard_size,
-            cp=parallesim_config.cp_size,
-            tp=parallesim_config.tp_size,
-            pp=parallesim_config.pp_size,
-            ep=parallesim_config.ep_size,
-            world_size=parallesim_config.world_size,
-            pp_dynamic_shape=parallesim_config.pp_dynamic_shape,
+            dp_replicate=parallelism_config.dp_replicate_size,
+            dp_shard=parallelism_config.dp_shard_size,
+            cp=parallelism_config.cp_size,
+            tp=parallelism_config.tp_size,
+            pp=parallelism_config.pp_size,
+            ep=parallelism_config.ep_size,
+            world_size=parallelism_config.world_size,
+            pp_dynamic_shape=parallelism_config.pp_dynamic_shape,
+            pp_micro_batch_size=parallelism_config.pp_micro_batch_size,
+            pp_schedule=parallelism_config.pp_schedule,
+            pp_layers_per_stage=parallelism_config.pp_layers_per_stage,
         )
 
     @staticmethod
-    def from_config_for_analysis(parallesim_config: ParallelismConfig, world_size: int):
+    def from_config_for_analysis(
+        parallelism_config: ParallelismConfig, world_size: int
+    ):
         return ParallelDims(
-            dp_replicate=parallesim_config.dp_replicate_size,
-            dp_shard=parallesim_config.dp_shard_size,
-            cp=parallesim_config.cp_size,
-            tp=parallesim_config.tp_size,
-            pp=parallesim_config.pp_size,
-            ep=parallesim_config.ep_size,
+            dp_replicate=parallelism_config.dp_replicate_size,
+            dp_shard=parallelism_config.dp_shard_size,
+            cp=parallelism_config.cp_size,
+            tp=parallelism_config.tp_size,
+            pp=parallelism_config.pp_size,
+            ep=parallelism_config.ep_size,
             world_size=world_size,
-            pp_dynamic_shape=parallesim_config.pp_dynamic_shape,
+            pp_dynamic_shape=parallelism_config.pp_dynamic_shape,
+            pp_micro_batch_size=parallelism_config.pp_micro_batch_size,
+            pp_schedule=parallelism_config.pp_schedule,
+            pp_layers_per_stage=parallelism_config.pp_layers_per_stage,
         )
 
     def __post_init__(self):
@@ -284,31 +294,65 @@ class ParallelDims:
             mp_mesh_dim_names.append("pp")
             pp_cp_tp_mesh_dim_names.append("pp")
 
+        def _safe_flatten(submesh, mesh_dim_name):
+            """Call ``DeviceMesh._flatten`` defensively.
+
+            When a rank is outside the parent ``DeviceMesh`` (e.g. tests that
+            build a ``world_size=1`` mesh from a multi-rank ``torchrun``
+            launch, where only rank 0 participates), PyTorch's
+            ``create_flatten_mesh`` hits an ``UnboundLocalError`` on
+            ``res_flattened_mesh`` because the variable is only assigned on
+            the participating branch. Tolerate that here so downstream code
+            can still skip gracefully on non-participating ranks.
+            """
+            try:
+                if submesh.get_coordinate() is None:
+                    return None
+            except Exception:  # pragma: no cover - defensive
+                pass
+            try:
+                return submesh._flatten(mesh_dim_name=mesh_dim_name)
+            except UnboundLocalError as err:
+                logger.debug(
+                    "DeviceMesh._flatten(%s) raised UnboundLocalError "
+                    "(likely due to this rank being outside the mesh): %s",
+                    mesh_dim_name,
+                    err,
+                )
+                return None
+
         if dp_mesh_dim_names != []:
-            mesh[tuple(dp_mesh_dim_names)]._flatten(mesh_dim_name="dp")
+            _safe_flatten(mesh[tuple(dp_mesh_dim_names)], mesh_dim_name="dp")
         if dp_shard_cp_mesh_dim_names != []:
-            mesh[tuple(dp_shard_cp_mesh_dim_names)]._flatten(
-                mesh_dim_name="dp_shard_cp"
+            _safe_flatten(
+                mesh[tuple(dp_shard_cp_mesh_dim_names)],
+                mesh_dim_name="dp_shard_cp",
             )
         if loss_parallel_mesh_dim_names != []:
-            mesh[tuple(loss_parallel_mesh_dim_names)]._flatten(
-                mesh_dim_name="loss_parallel"
+            _safe_flatten(
+                mesh[tuple(loss_parallel_mesh_dim_names)],
+                mesh_dim_name="loss_parallel",
             )
         if dp_cp_tp_mesh_dim_names != []:
-            mesh[tuple(dp_cp_tp_mesh_dim_names)]._flatten(mesh_dim_name="dp_cp_tp")
+            _safe_flatten(
+                mesh[tuple(dp_cp_tp_mesh_dim_names)], mesh_dim_name="dp_cp_tp"
+            )
         if dp_cp_mesh_dim_names != []:
-            mesh[tuple(dp_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_cp")
+            _safe_flatten(mesh[tuple(dp_cp_mesh_dim_names)], mesh_dim_name="dp_cp")
 
         if weight_loading_mesh_dim_names != []:
-            mesh[tuple(weight_loading_mesh_dim_names)]._flatten(
-                mesh_dim_name="weight_loading"
+            _safe_flatten(
+                mesh[tuple(weight_loading_mesh_dim_names)],
+                mesh_dim_name="weight_loading",
             )
 
         if mp_mesh_dim_names != []:
-            mesh[tuple(mp_mesh_dim_names)]._flatten(mesh_dim_name="mp")
+            _safe_flatten(mesh[tuple(mp_mesh_dim_names)], mesh_dim_name="mp")
 
         if pp_cp_tp_mesh_dim_names != []:
-            mesh[tuple(pp_cp_tp_mesh_dim_names)]._flatten(mesh_dim_name="pp_cp_tp")
+            _safe_flatten(
+                mesh[tuple(pp_cp_tp_mesh_dim_names)], mesh_dim_name="pp_cp_tp"
+            )
 
         self.mesh = mesh
         return mesh
@@ -452,9 +496,10 @@ class ParallelDims:
         if not self.dp_shard_enabled and not self.cp_enabled:
             return 0, 1
         else:
-            return self.mesh[tuple(("dp_shard_cp",))].get_local_rank(), self.mesh[
-                tuple(("dp_shard_cp",))
-            ].size()
+            return (
+                self.mesh[tuple(("dp_shard_cp",))].get_local_rank(),
+                self.mesh[tuple(("dp_shard_cp",))].size(),
+            )
 
     @property
     def mp_coord(self):

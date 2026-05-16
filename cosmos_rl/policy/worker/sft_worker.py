@@ -424,6 +424,7 @@ class SFTPolicyWorker(PolicyWorkerBase):
             train_stream=self.train_stream,
             data_packer=self.data_packer,
             val_data_packer=self.val_data_packer,
+            hook_fns=self.hook_fns,
         )
         self.ckpt_total_steps, self.train_step, _ = self.trainer.load_model()
         if isinstance(dataset, Callable):
@@ -497,28 +498,31 @@ class SFTPolicyWorker(PolicyWorkerBase):
         elif sampler is not None:
             logger.info("Using user-provided sampler for training dataset.")
             if isinstance(sampler, Callable):
+                # drop_last=True when PP is enabled to avoid incomplete microbatches at epoch end
                 train_sampler = sampler(
                     train_dataset,
                     num_replicas=self.dp_world_size,
                     rank=self.dp_rank,
                     shuffle=self.config.train.train_policy.dataloader_shuffle,
-                    drop_last=False,
+                    drop_last=self.parallel_dims.pp_enabled,
                 )
             else:
                 train_sampler = sampler
         else:
+            # drop_last=True when PP is enabled to avoid incomplete microbatches at epoch end
             train_sampler = DistributedSampler(
                 train_dataset,
                 num_replicas=self.dp_world_size,
                 rank=self.dp_rank,
                 shuffle=self.config.train.train_policy.dataloader_shuffle,
-                drop_last=False,
+                drop_last=self.parallel_dims.pp_enabled,
                 seed=self.config.train.train_policy.dataloader_seed,
             )
         self.train_sampler = train_sampler
 
         if batch_sampler is not None and isinstance(batch_sampler, Callable):
             sig = inspect.signature(batch_sampler)
+            # drop_last=True when PP is enabled to avoid incomplete microbatches at epoch end
             kwargs = {
                 "dataset": train_dataset.dataset,
                 "num_replicas": self.dp_world_size,
@@ -527,7 +531,7 @@ class SFTPolicyWorker(PolicyWorkerBase):
                 "config": self.config,
                 "sampler": self.train_sampler,
                 "batch_size": self.config.train.train_batch_per_replica,
-                "drop_last": False,
+                "drop_last": self.parallel_dims.pp_enabled,
             }
             # Filter kwargs to only those the function accepts
             filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
@@ -560,6 +564,7 @@ class SFTPolicyWorker(PolicyWorkerBase):
                     collate_fn=collate_fn,
                 )
             else:
+                # drop_last=True when PP is enabled to avoid incomplete microbatches at epoch end
                 data_loader = DataLoader(
                     train_dataset,
                     batch_size=self.config.train.train_batch_per_replica,
@@ -568,7 +573,8 @@ class SFTPolicyWorker(PolicyWorkerBase):
                     prefetch_factor=self.config.train.train_policy.dataloader_prefetch_factor,
                     sampler=sampler,
                     collate_fn=collate_fn,
-                    drop_last=self.config.train.train_policy.dataloader_drop_last,
+                    drop_last=self.config.train.train_policy.dataloader_drop_last
+                    or self.parallel_dims.pp_enabled,
                 )
             return data_loader
 

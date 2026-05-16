@@ -54,6 +54,7 @@ class CheckpointMananger:
         parallel_dims: Optional[ParallelDims] = None,
         global_rank: int = 0,
         metric: str = "val_loss",
+        hook_fns: Dict[str, Callable] = {},
     ):
         self.config = config
         self.parallel_dims = parallel_dims
@@ -80,6 +81,15 @@ class CheckpointMananger:
             self._prune_corrupted_ckpts()
             # Load best score from file if exists (persists across resumes)
             self.best_score, self.best_ckpt_abs_dir = self._load_best_score()
+        if "save_checkpoint_hook" in hook_fns:
+            self.save_checkpoint_hook = hook_fns["save_checkpoint_hook"]
+        else:
+            self.save_checkpoint_hook = None
+
+        if "load_checkpoint_hook" in hook_fns:
+            self.load_checkpoint_hook = hook_fns["load_checkpoint_hook"]
+        else:
+            self.load_checkpoint_hook = None
 
     def _is_master_rank(self) -> bool:
         return (self.parallel_dims is None and self.global_rank == 0) or (
@@ -396,6 +406,8 @@ class CheckpointMananger:
         state_dict_cpu = {}
         for key, value in state_dict.items():
             if isinstance(value, torch.Tensor):
+                if value.is_meta:
+                    continue
                 state_dict_cpu[key] = value.cpu()
             elif isinstance(value, dict):
                 state_dict_cpu[key] = self.offload_state_dict_cpu(value)
@@ -437,6 +449,8 @@ class CheckpointMananger:
             scheduler (torch.optim.lr_scheduler._LRScheduler): The scheduler to save.
             step (int): The current training step.
             **kwargs: Additional information to save, e.g., is_final.
+        Returns:
+            str: The path to the saved checkpoint directory.
         """
 
         def _save_upload(state_dict, local_rel_path, is_final=False):
@@ -587,6 +601,19 @@ class CheckpointMananger:
         logger.info(
             f"[Policy] Step: {step}, checkpoint saved successfully at {os.path.join(self.ckpt_output_dir, cur_step_ckpt_dir)}."
         )
+        if self.save_checkpoint_hook is not None:
+            self.save_checkpoint_hook(
+                self,
+                data={
+                    "checkpoint_path": os.path.join(
+                        self.ckpt_output_dir, cur_step_ckpt_dir
+                    ),
+                    "step": step,
+                    "total_steps": total_steps,
+                    **kwargs,
+                },
+            )
+        return os.path.join(self.ckpt_output_dir, cur_step_ckpt_dir)
 
     def load_checkpoint(
         self,
@@ -596,6 +623,10 @@ class CheckpointMananger:
         model_name_or_path: str,
         revision: Optional[str] = None,
         strict: bool = True,
+        pp_model_parts: Optional[List] = None,
+        pp_model_module_paths: Optional[
+            List[str]
+        ] = None,  # dotted module paths for each PP stage
     ) -> tuple[Dict, torch.optim.lr_scheduler._LRScheduler]:
         extra_vars = {}
         base_paths: List[str] = self.get_latest_ckpt_paths()
@@ -644,10 +675,19 @@ class CheckpointMananger:
                         )
                         new_scheduler = scheduler
 
-                    model.load_state_dict(
-                        torch.load(model_path, weights_only=False, map_location="cpu"),
-                        strict=strict,
+                    saved_state = torch.load(
+                        model_path, weights_only=False, map_location="cpu"
                     )
+                    if pp_model_parts is not None and pp_model_module_paths is not None:
+                        for mp, prefix in zip(pp_model_parts, pp_model_module_paths):
+                            mp_state = {}
+                            prefix_dot = f"{prefix}." if prefix else ""
+                            for k, v in saved_state.items():
+                                if k.startswith(prefix_dot):
+                                    mp_state[k[len(prefix_dot) :]] = v
+                            mp.load_state_dict(mp_state, strict=False)
+                    else:
+                        model.load_state_dict(saved_state, strict=strict)
                     optimizer.load_state_dict(
                         torch.load(
                             optimizer_path, weights_only=False, map_location="cpu"
@@ -664,6 +704,14 @@ class CheckpointMananger:
                     logger.info(
                         f"[Policy] Checkpoint loaded successfully from {base_path}."
                     )
+                    if self.load_checkpoint_hook is not None:
+                        self.load_checkpoint_hook(
+                            self,
+                            data={
+                                "checkpoint_path": base_path,
+                                "extra_vars": extra_vars,
+                            },
+                        )
                     return extra_vars, new_scheduler
             except Exception as e:
                 import traceback

@@ -17,9 +17,18 @@
 /data/
 outputs/
 results/
+test_outputs/
 checkpoints/*
 !checkpoints/README.md
 reward_service/Qwen2-VL-2B-Instruct
+
+# Whitelist specific CI test fixtures that are otherwise caught by
+# imaginaire4/.gitignore's global *.jpg / *.mp4 rules. Without these
+# overrides the CI checkout is missing the fixtures and
+# tests/test_hf_models.py / tests/test_data_packer.py fail with
+# FileNotFoundError when opening the image/video.
+!tests/data/test_hf_model.jpg
+!tests/data/test_data_packer.mp4
 
 # Data types
 *.jit
@@ -35,6 +44,7 @@ reward_service/Qwen2-VL-2B-Instruct
 *.pkl
 *.pt
 *.bin
+*.safetensors
 
 # Other uncheckable file types
 *.zip
@@ -258,5 +268,6 @@ nemotron_vl/*.sh
 nemotron_vl/*.txt
 nemotron_vl/*.png
 nemotron_vl/*.md
+nemotron_vl/dev_docs
 */nohup.out
 docs/plans
