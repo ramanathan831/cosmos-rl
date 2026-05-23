@@ -53,6 +53,10 @@ from cosmos_rl.policy.worker.base import PolicyWorkerBase
 from cosmos_rl.dispatcher.data.load_balanced_dataset import LoadBalancedDataset
 
 
+def _is_pp_enabled(parallel_dims) -> bool:
+    return bool(getattr(parallel_dims, "pp_enabled", False))
+
+
 class SFTDataset(Dataset):
     def __init__(
         self,
@@ -313,9 +317,12 @@ def construct_dataset(
     # Determine cache settings for train and val separately
     train_enable_cache = config.enable_dataset_cache
     # For validation: use validation.enable_dataset_cache if set, otherwise fallback to train setting
+    validation_enable_cache = getattr(
+        cosmos_config.validation, "enable_dataset_cache", None
+    )
     val_enable_cache = (
-        cosmos_config.validation.enable_dataset_cache
-        if cosmos_config.validation.enable_dataset_cache is not None
+        validation_enable_cache
+        if validation_enable_cache is not None
         else config.enable_dataset_cache
     )
 
@@ -573,7 +580,7 @@ class SFTPolicyWorker(PolicyWorkerBase):
                     num_replicas=self.dp_world_size,
                     rank=self.dp_rank,
                     shuffle=self.config.train.train_policy.dataloader_shuffle,
-                    drop_last=self.parallel_dims.pp_enabled,
+                    drop_last=_is_pp_enabled(self.parallel_dims),
                 )
             else:
                 train_sampler = sampler
@@ -584,7 +591,7 @@ class SFTPolicyWorker(PolicyWorkerBase):
                 num_replicas=self.dp_world_size,
                 rank=self.dp_rank,
                 shuffle=self.config.train.train_policy.dataloader_shuffle,
-                drop_last=self.parallel_dims.pp_enabled,
+                drop_last=_is_pp_enabled(self.parallel_dims),
                 seed=self.config.train.train_policy.dataloader_seed,
             )
         self.train_sampler = train_sampler
@@ -600,7 +607,7 @@ class SFTPolicyWorker(PolicyWorkerBase):
                 "config": self.config,
                 "sampler": self.train_sampler,
                 "batch_size": self.config.train.train_batch_per_replica,
-                "drop_last": self.parallel_dims.pp_enabled,
+                "drop_last": _is_pp_enabled(self.parallel_dims),
             }
             # Filter kwargs to only those the function accepts
             filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
@@ -643,7 +650,7 @@ class SFTPolicyWorker(PolicyWorkerBase):
                     sampler=sampler,
                     collate_fn=collate_fn,
                     drop_last=self.config.train.train_policy.dataloader_drop_last
-                    or self.parallel_dims.pp_enabled,
+                    or _is_pp_enabled(self.parallel_dims),
                 )
             return data_loader
 
@@ -746,14 +753,20 @@ class SFTPolicyWorker(PolicyWorkerBase):
                 self.train_sampler, self.train_batch_sampler
             )
 
+        validation_num_workers = getattr(
+            self.config.validation,
+            "dataloader_num_workers",
+            self.config.train.train_policy.dataloader_num_workers,
+        )
         val_num_workers = (
-            self.config.validation.dataloader_num_workers
-            if self.config.validation.dataloader_num_workers > 0
+            validation_num_workers
+            if validation_num_workers > 0
             else self.config.train.train_policy.dataloader_num_workers
         )
         val_prefetch_factor = (
-            self.config.validation.dataloader_prefetch_factor
-            if self.config.validation.dataloader_prefetch_factor is not None
+            getattr(self.config.validation, "dataloader_prefetch_factor", None)
+            if getattr(self.config.validation, "dataloader_prefetch_factor", None)
+            is not None
             else self.config.train.train_policy.dataloader_prefetch_factor
         )
         if hasattr(val_dataset.dataset, "data_loader"):
@@ -1032,7 +1045,7 @@ class SFTPolicyWorker(PolicyWorkerBase):
     def get_batch_from_dataloader(self, data_loader):
         # self.iter = iter(self.train_data_loader)
         if self.config.train.train_policy.dataloader_broadcast and (
-            self.parallel_dims.pp_enabled
+            _is_pp_enabled(self.parallel_dims)
             or self.parallel_dims.cp_enabled
             or self.parallel_dims.tp_enabled
         ):
@@ -1077,7 +1090,7 @@ class SFTPolicyWorker(PolicyWorkerBase):
         self.profiler.start()
         pp_last_stage = False
 
-        if self.parallel_dims.pp_enabled:
+        if _is_pp_enabled(self.parallel_dims):
             pp_last_stage = (
                 self.parallel_dims.pp_coord[0] == self.parallel_dims.pp_coord[1] - 1
             )
