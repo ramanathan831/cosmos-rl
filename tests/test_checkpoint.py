@@ -19,6 +19,8 @@ import os
 import shutil
 import tempfile
 import unittest
+from concurrent.futures import Future
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
@@ -330,6 +332,301 @@ class TestCheckpointManager(unittest.TestCase):
         target = os.readlink(best_ckpt_link)
         self.assertTrue(target.endswith("step_100"))
 
+    def test_max_keep_one_retains_new_best_checkpoint(self):
+        """A newly improved checkpoint must become best before retention runs."""
+        output_dir = os.path.join(self.test_dir, self.timestamp1)
+        config = create_test_config(output_dir=output_dir, max_keep=1)
+        manager = CheckpointMananger(
+            config,
+            parallel_dims=create_test_parallel_dims(),
+            global_rank=0,
+            metric="val_loss",
+        )
+
+        step_100_path = self._create_and_record_checkpoint(manager, 100, 0.5)
+        step_200_path = self._create_and_record_checkpoint(manager, 200, 0.4)
+
+        self.assertFalse(os.path.exists(step_100_path))
+        self.assertTrue(os.path.isdir(step_200_path))
+        self.assertEqual(manager.saved_ckpt_step_dirs, [step_200_path])
+        self.assertEqual(manager.best_ckpt_abs_dir, os.path.abspath(step_200_path))
+
+        best_ckpt_link = os.path.join(self.test_dir, "best", "checkpoints")
+        self.assertTrue(os.path.exists(best_ckpt_link))
+        self.assertTrue(os.path.samefile(best_ckpt_link, step_200_path))
+
+    def test_new_best_prunes_former_best_when_max_keep_is_exceeded(self):
+        """Retention should keep the latest checkpoints after the best changes."""
+        output_dir = os.path.join(self.test_dir, self.timestamp1)
+        config = create_test_config(output_dir=output_dir, max_keep=2)
+        manager = CheckpointMananger(
+            config,
+            parallel_dims=create_test_parallel_dims(),
+            global_rank=0,
+            metric="val_loss",
+        )
+
+        step_100_path = self._create_and_record_checkpoint(manager, 100, 0.5)
+        step_200_path = self._create_and_record_checkpoint(manager, 200, 0.6)
+        step_300_path = self._create_and_record_checkpoint(manager, 300, 0.4)
+
+        self.assertFalse(os.path.exists(step_100_path))
+        self.assertTrue(os.path.isdir(step_200_path))
+        self.assertTrue(os.path.isdir(step_300_path))
+        self.assertEqual(manager.saved_ckpt_step_dirs, [step_200_path, step_300_path])
+
+    def test_retention_keeps_existing_best_and_latest_checkpoint(self):
+        """An older best should replace the oldest non-best retention slot."""
+        output_dir = os.path.join(self.test_dir, self.timestamp1)
+        config = create_test_config(output_dir=output_dir, max_keep=2)
+        manager = CheckpointMananger(
+            config,
+            parallel_dims=create_test_parallel_dims(),
+            global_rank=0,
+            metric="val_loss",
+        )
+
+        step_100_path = self._create_and_record_checkpoint(manager, 100, 0.5)
+        step_200_path = self._create_and_record_checkpoint(manager, 200, 0.6)
+        step_300_path = self._create_and_record_checkpoint(manager, 300, 0.7)
+
+        self.assertTrue(os.path.isdir(step_100_path))
+        self.assertFalse(os.path.exists(step_200_path))
+        self.assertTrue(os.path.isdir(step_300_path))
+        self.assertEqual(manager.saved_ckpt_step_dirs, [step_100_path, step_300_path])
+
+    def test_max_keep_unlimited_retains_all_checkpoints_and_updates_best(self):
+        """max_keep=-1 should disable pruning without affecting best tracking."""
+        output_dir = os.path.join(self.test_dir, self.timestamp1)
+        config = create_test_config(output_dir=output_dir, max_keep=-1)
+        manager = CheckpointMananger(
+            config,
+            parallel_dims=create_test_parallel_dims(),
+            global_rank=0,
+            metric="val_loss",
+        )
+
+        step_100_path = self._create_and_record_checkpoint(manager, 100, 0.5)
+        step_200_path = self._create_and_record_checkpoint(manager, 200, 0.4)
+
+        self.assertTrue(os.path.isdir(step_100_path))
+        self.assertTrue(os.path.isdir(step_200_path))
+        self.assertEqual(manager.saved_ckpt_step_dirs, [step_100_path, step_200_path])
+        self.assertEqual(manager.best_ckpt_abs_dir, os.path.abspath(step_200_path))
+
+    def test_duplicate_save_check_does_not_consume_retention_capacity(self):
+        """Repeated final/signal bookkeeping for one step counts only once."""
+        output_dir = os.path.join(self.test_dir, self.timestamp1)
+        config = create_test_config(output_dir=output_dir, max_keep=2)
+        manager = CheckpointMananger(
+            config,
+            parallel_dims=create_test_parallel_dims(),
+            global_rank=0,
+            metric="val_loss",
+        )
+
+        step_100_path = self._create_and_record_checkpoint(manager, 100, 0.5)
+        manager.save_check(100, val_score=0.5)
+        step_200_path = self._create_and_record_checkpoint(manager, 200, 0.6)
+
+        self.assertEqual(manager.saved_ckpt_step_dirs, [step_100_path, step_200_path])
+        self.assertTrue(os.path.isdir(step_100_path))
+        self.assertTrue(os.path.isdir(step_200_path))
+
+    def test_resume_defers_retention_until_next_successful_save(self):
+        """Resume must preserve load candidates until a new checkpoint is saved."""
+        output_dir = os.path.join(self.test_dir, self.timestamp1)
+        config = create_test_config(output_dir=output_dir, resume=True, max_keep=2)
+        checkpoint_root = os.path.join(output_dir, "checkpoints")
+        os.makedirs(checkpoint_root, exist_ok=True)
+
+        step_paths = [
+            self._create_complete_checkpoint_dir(checkpoint_root, step)
+            for step in (100, 200, 300, 400)
+        ]
+
+        best_dir = os.path.join(self.test_dir, "best")
+        os.makedirs(best_dir, exist_ok=True)
+        os.symlink(step_paths[0], os.path.join(best_dir, "checkpoints"))
+        with open(os.path.join(best_dir, "best_score.json"), "w") as f:
+            json.dump(
+                {
+                    "best_score": 0.5,
+                    "best_ckpt_abs_dir": os.path.abspath(step_paths[0]),
+                },
+                f,
+            )
+
+        manager = CheckpointMananger(
+            config,
+            parallel_dims=create_test_parallel_dims(),
+            global_rank=0,
+            metric="val_loss",
+        )
+
+        self.assertEqual(manager.saved_ckpt_step_dirs, step_paths)
+        self.assertTrue(all(os.path.isdir(path) for path in step_paths))
+
+        step_500_path = self._create_complete_checkpoint_dir(checkpoint_root, 500)
+        manager.save_check(500, val_score=0.6)
+
+        self.assertEqual(manager.saved_ckpt_step_dirs, [step_paths[0], step_500_path])
+        self.assertTrue(os.path.isdir(step_paths[0]))
+        self.assertFalse(os.path.exists(step_paths[1]))
+        self.assertFalse(os.path.exists(step_paths[2]))
+        self.assertFalse(os.path.exists(step_paths[3]))
+        self.assertTrue(os.path.isdir(step_500_path))
+
+    def test_resume_with_missing_best_metadata_does_not_eagerly_prune(self):
+        self._assert_resume_does_not_eagerly_prune(
+            case_name="missing_best_metadata",
+            best_score_contents=None,
+        )
+
+    def test_resume_with_malformed_best_metadata_does_not_eagerly_prune(self):
+        self._assert_resume_does_not_eagerly_prune(
+            case_name="malformed_best_metadata",
+            best_score_contents="{malformed-json",
+        )
+
+    def test_failed_checkpoint_deletion_stays_tracked_and_is_retried(self):
+        output_dir = os.path.join(self.test_dir, self.timestamp1)
+        config = create_test_config(output_dir=output_dir, max_keep=1)
+        manager = CheckpointMananger(
+            config,
+            parallel_dims=create_test_parallel_dims(),
+            global_rank=0,
+            metric="val_loss",
+        )
+
+        step_100_path = os.path.join(manager.ckpt_output_dir, "step_100")
+        os.makedirs(step_100_path, exist_ok=True)
+        manager.save_check(100)
+
+        step_200_path = os.path.join(manager.ckpt_output_dir, "step_200")
+        os.makedirs(step_200_path, exist_ok=True)
+        with patch(
+            "cosmos_rl.utils.checkpoint.shutil.rmtree",
+            side_effect=PermissionError("checkpoint is owned by another user"),
+        ):
+            manager.save_check(200)
+
+        self.assertEqual(manager.saved_ckpt_step_dirs, [step_100_path, step_200_path])
+        self.assertTrue(os.path.isdir(step_100_path))
+
+        step_300_path = os.path.join(manager.ckpt_output_dir, "step_300")
+        os.makedirs(step_300_path, exist_ok=True)
+        manager.save_check(300)
+
+        self.assertEqual(manager.saved_ckpt_step_dirs, [step_300_path])
+        self.assertFalse(os.path.exists(step_100_path))
+        self.assertFalse(os.path.exists(step_200_path))
+        self.assertTrue(os.path.isdir(step_300_path))
+
+    def test_async_new_best_waits_for_all_rank_markers_before_pruning(self):
+        output_dir = os.path.join(self.test_dir, self.timestamp1)
+        config = create_test_config(
+            output_dir=output_dir,
+            max_keep=1,
+            save_mode="async",
+        )
+        parallel_dims = ParallelDims(
+            dp_replicate=1,
+            dp_shard=2,
+            cp=1,
+            tp=1,
+            pp=1,
+            world_size=2,
+            pp_dynamic_shape=False,
+        )
+        manager = CheckpointMananger(
+            config,
+            parallel_dims=parallel_dims,
+            global_rank=0,
+            metric="val_loss",
+        )
+
+        checkpoint_root = manager.ckpt_output_dir
+        step_100_path = self._create_complete_checkpoint_dir(
+            checkpoint_root, 100, rank_markers=(0, 1)
+        )
+        manager.save_check(100, val_score=0.5)
+
+        step_200_path = self._create_complete_checkpoint_dir(
+            checkpoint_root, 200, rank_markers=(0,)
+        )
+        pending_save = Future()
+        manager.pre_save_futures = [pending_save]
+        manager.save_check(200, val_score=0.4)
+
+        self.assertEqual(manager.best_ckpt_abs_dir, os.path.abspath(step_100_path))
+        self.assertTrue(os.path.isdir(step_100_path))
+        self.assertTrue(
+            os.path.samefile(
+                os.path.join(self.test_dir, "best", "checkpoints"), step_100_path
+            )
+        )
+
+        pending_save.set_result(None)
+        manager.finalize()
+
+        # Rank 1 has not completed the new best, so the last durable best remains.
+        self.assertEqual(manager.best_ckpt_abs_dir, os.path.abspath(step_100_path))
+        self.assertTrue(os.path.isdir(step_100_path))
+        self.assertTrue(os.path.isdir(step_200_path))
+
+        with open(os.path.join(step_200_path, "policy", ".rank_1_complete"), "w"):
+            pass
+        manager.finalize()
+
+        self.assertEqual(manager.best_ckpt_abs_dir, os.path.abspath(step_200_path))
+        self.assertFalse(os.path.exists(step_100_path))
+        self.assertTrue(os.path.isdir(step_200_path))
+
+    def test_async_failed_save_keeps_previous_best_checkpoint(self):
+        output_dir = os.path.join(self.test_dir, self.timestamp1)
+        config = create_test_config(
+            output_dir=output_dir,
+            max_keep=1,
+            save_mode="async",
+        )
+        manager = CheckpointMananger(
+            config,
+            parallel_dims=create_test_parallel_dims(),
+            global_rank=0,
+            metric="val_loss",
+        )
+
+        step_100_path = self._create_complete_checkpoint_dir(
+            manager.ckpt_output_dir, 100
+        )
+        manager.save_check(100, val_score=0.5)
+
+        step_200_path = os.path.join(manager.ckpt_output_dir, "step_200")
+        os.makedirs(os.path.join(step_200_path, "policy"), exist_ok=True)
+        failed_save = Future()
+        manager.pre_save_futures = [failed_save]
+        manager.save_check(200, val_score=0.4)
+        failed_save.set_exception(OSError(28, "No space left on device"))
+        manager.finalize()
+
+        best_ckpt_link = os.path.join(self.test_dir, "best", "checkpoints")
+        self.assertEqual(manager.best_ckpt_abs_dir, os.path.abspath(step_100_path))
+        self.assertTrue(os.path.samefile(best_ckpt_link, step_100_path))
+        self.assertTrue(os.path.isdir(step_100_path))
+        self.assertTrue(os.path.isdir(step_200_path))
+
+    def test_invalid_zero_max_keep_is_rejected(self):
+        output_dir = os.path.join(self.test_dir, self.timestamp1)
+        config = create_test_config(output_dir=output_dir, max_keep=0)
+
+        with self.assertRaisesRegex(ValueError, "max_keep"):
+            CheckpointMananger(
+                config,
+                parallel_dims=create_test_parallel_dims(),
+                global_rank=0,
+            )
+
     def test_async_delete_checkpoint(self):
         """Test that checkpoint deletion works correctly in async mode."""
         parallel_dims = create_test_parallel_dims()
@@ -360,6 +657,72 @@ class TestCheckpointManager(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(ckpt_dir, "step_100")))
         self.assertTrue(os.path.exists(os.path.join(ckpt_dir, "step_200")))
         self.assertTrue(os.path.exists(os.path.join(ckpt_dir, "step_300")))
+        self.assertEqual(
+            manager.saved_ckpt_step_dirs,
+            [
+                os.path.join(ckpt_dir, "step_200"),
+                os.path.join(ckpt_dir, "step_300"),
+            ],
+        )
+
+    def _assert_resume_does_not_eagerly_prune(self, case_name, best_score_contents):
+        output_dir = os.path.join(self.test_dir, case_name, self.timestamp1)
+        config = create_test_config(output_dir=output_dir, resume=True, max_keep=1)
+        checkpoint_root = os.path.join(output_dir, "checkpoints")
+        os.makedirs(checkpoint_root, exist_ok=True)
+        step_paths = [
+            self._create_complete_checkpoint_dir(checkpoint_root, step)
+            for step in (100, 200, 300)
+        ]
+
+        best_dir = os.path.join(os.path.dirname(output_dir), "best")
+        os.makedirs(best_dir, exist_ok=True)
+        os.symlink(step_paths[0], os.path.join(best_dir, "checkpoints"))
+        if best_score_contents is not None:
+            with open(os.path.join(best_dir, "best_score.json"), "w") as f:
+                f.write(best_score_contents)
+
+        manager = CheckpointMananger(
+            config,
+            parallel_dims=create_test_parallel_dims(),
+            global_rank=0,
+            metric="val_loss",
+        )
+
+        self.assertEqual(manager.best_ckpt_abs_dir, os.path.abspath(step_paths[0]))
+        self.assertEqual(manager.saved_ckpt_step_dirs, step_paths)
+        self.assertTrue(all(os.path.isdir(path) for path in step_paths))
+
+        step_400_path = self._create_complete_checkpoint_dir(checkpoint_root, 400)
+        # Without the recovered best's score, a different checkpoint's score
+        # cannot prove improvement and must not cause the prior best to be
+        # replaced or pruned.
+        manager.save_check(400, val_score=0.9)
+
+        self.assertEqual(manager.saved_ckpt_step_dirs, [step_paths[0]])
+        self.assertTrue(
+            os.path.samefile(os.path.join(best_dir, "checkpoints"), step_paths[0])
+        )
+        self.assertTrue(os.path.isdir(step_paths[0]))
+        self.assertFalse(os.path.exists(step_400_path))
+
+    def _create_complete_checkpoint_dir(self, checkpoint_root, step, rank_markers=(0,)):
+        step_path = os.path.join(checkpoint_root, f"step_{step}")
+        policy_path = os.path.join(step_path, "policy")
+        os.makedirs(policy_path, exist_ok=True)
+        with open(os.path.join(policy_path, "cosmos_config"), "w"):
+            pass
+        for rank in rank_markers:
+            with open(os.path.join(policy_path, f".rank_{rank}_complete"), "w"):
+                pass
+        return step_path
+
+    def _create_and_record_checkpoint(self, manager, step, val_score):
+        """Create a checkpoint directory and run its post-save retention check."""
+        step_path = os.path.join(manager.ckpt_output_dir, f"step_{step}")
+        os.makedirs(step_path, exist_ok=True)
+        manager.save_check(step, val_score=val_score)
+        return step_path
 
     def _state_dicts_equal(self, sd1, sd2):
         """Helper to compare two state dicts."""

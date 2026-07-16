@@ -16,9 +16,11 @@
 import os
 import re
 import json
+import math
 import torch
 import random
 import shutil
+import tempfile
 import numpy as np
 import concurrent.futures as futures
 from cosmos_rl.utils.util import is_master_rank
@@ -60,6 +62,8 @@ class CheckpointMananger:
         self.parallel_dims = parallel_dims
         self.global_rank = global_rank
         self.max_keep = config.train.ckpt.max_keep
+        if self.max_keep == 0 or self.max_keep < -1:
+            raise ValueError("train.ckpt.max_keep must be -1 or a positive integer")
         self.metric = metric
         self.save_mode = config.train.ckpt.save_mode
         self.ckpt_output_dir = os.path.join(config.train.output_dir, "checkpoints")
@@ -73,6 +77,8 @@ class CheckpointMananger:
             if self.save_mode == "async":
                 self.executor = futures.ThreadPoolExecutor(max_workers=4)
         self.pre_save_futures = []
+        self._pending_delete_futures = {}
+        self._pending_save_checks = []
         if self._is_master_rank():
             self.saved_ckpt_step_dirs = sorted(
                 self._get_all_saved_ckpt_step_dirs(),
@@ -80,6 +86,7 @@ class CheckpointMananger:
             )
             self._prune_corrupted_ckpts()
             # Load best score from file if exists (persists across resumes)
+            self._best_score_known = False
             self.best_score, self.best_ckpt_abs_dir = self._load_best_score()
         if "save_checkpoint_hook" in hook_fns:
             self.save_checkpoint_hook = hook_fns["save_checkpoint_hook"]
@@ -108,9 +115,14 @@ class CheckpointMananger:
 
         # Remove corrupted checkpoints
         for ckpt_dir in dirs_to_remove:
-            self._delete_checkpoint(ckpt_dir)
-            self.saved_ckpt_step_dirs.remove(ckpt_dir)
-            logger.info(f"Pruned corrupted checkpoint: {ckpt_dir}")
+            if self._delete_checkpoint(ckpt_dir):
+                self.saved_ckpt_step_dirs.remove(ckpt_dir)
+                logger.info(f"Pruned corrupted checkpoint: {ckpt_dir}")
+            else:
+                logger.warning(
+                    f"Could not prune corrupted checkpoint; retaining it for retry: "
+                    f"{ckpt_dir}"
+                )
 
     def _get_num_saving_ranks(self) -> int:
         """
@@ -250,6 +262,12 @@ class CheckpointMananger:
                 with open(best_score_path, "r") as f:
                     data = json.load(f)
                     score = data.get("best_score", default_score)
+                    if (
+                        isinstance(score, bool)
+                        or not isinstance(score, (int, float))
+                        or not math.isfinite(score)
+                    ):
+                        raise ValueError(f"Invalid best checkpoint score: {score!r}")
                     best_ckpt_abs_dir = data.get("best_ckpt_abs_dir", None)
                     if (
                         best_ckpt_abs_dir is None
@@ -258,26 +276,72 @@ class CheckpointMananger:
                         raise ValueError(
                             f"Best checkpoint directory mismatch: {best_ckpt_abs_dir} != {self._get_best_ckpt_abs_dir()}"
                         )
+                    self._best_score_known = True
                     logger.info(f"Loaded best score from {best_score_path}: {score}")
                     return score, best_ckpt_abs_dir
             except Exception as e:
                 logger.warning(f"Failed to load best score from {best_score_path}: {e}")
+        best_ckpt_abs_dir = self._get_best_ckpt_abs_dir()
+        if best_ckpt_abs_dir is not None:
+            logger.warning(
+                "Best score metadata is unavailable; recovering the valid best "
+                f"checkpoint target from the symlink: {best_ckpt_abs_dir}"
+            )
+            self._best_score_known = False
+            return default_score, best_ckpt_abs_dir
+        # With no prior best checkpoint, the first scored checkpoint may
+        # establish both the score and target.
+        self._best_score_known = True
         return default_score, None
 
     def _save_best_score(self, score: float, best_ckpt_dir: str):
-        """Save the best score to file."""
+        """Atomically save the best score metadata."""
         best_score_path = self._best_score_path
         os.makedirs(os.path.dirname(best_score_path), exist_ok=True)
-        with open(best_score_path, "w") as f:
-            json.dump(
-                {
-                    "best_score": score,
-                    "best_ckpt_abs_dir": os.path.abspath(best_ckpt_dir),
-                    "metric": self.metric,
-                },
-                f,
-            )
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=os.path.dirname(best_score_path),
+                prefix=".best_score.",
+                suffix=".tmp",
+                delete=False,
+            ) as f:
+                tmp_path = f.name
+                json.dump(
+                    {
+                        "best_score": score,
+                        "best_ckpt_abs_dir": os.path.abspath(best_ckpt_dir),
+                        "metric": self.metric,
+                    },
+                    f,
+                )
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, best_score_path)
+        finally:
+            if tmp_path is not None and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
         logger.info(f"Saved best score to {best_score_path}: {score}")
+
+    @staticmethod
+    def _replace_symlink(target: str, link_path: str) -> None:
+        """Atomically replace one best-checkpoint symlink."""
+        link_dir = os.path.dirname(link_path)
+        fd, tmp_path = tempfile.mkstemp(
+            dir=link_dir,
+            prefix=f".{os.path.basename(link_path)}.",
+            suffix=".tmp",
+        )
+        os.close(fd)
+        os.unlink(tmp_path)
+        try:
+            os.symlink(target, tmp_path)
+            os.replace(tmp_path, link_path)
+        finally:
+            if os.path.lexists(tmp_path):
+                os.unlink(tmp_path)
 
     def _get_best_step_from_link(self) -> Optional[int]:
         """
@@ -351,7 +415,7 @@ class CheckpointMananger:
             and self.best_ckpt_abs_dir == os.path.abspath(ckpt_dir)
         )
 
-    def _delete_checkpoint(self, ckpt_dir: str):
+    def _delete_checkpoint(self, ckpt_dir: str) -> bool:
         """Delete checkpoint and safetensors for a given step.
 
         Args:
@@ -370,8 +434,108 @@ class CheckpointMananger:
             if os.path.exists(safetensors_dir):
                 shutil.rmtree(safetensors_dir)
                 logger.info(f"Removed old safetensors: {safetensors_dir}")
+            return True
         except Exception as e:
             logger.error(f"Error deleting checkpoint {ckpt_dir}: {e}")
+            return False
+
+    def _reconcile_pending_checkpoint_deletes(self):
+        """Apply completed async deletion results to the tracked checkpoint list."""
+        for ckpt_dir, future in list(self._pending_delete_futures.items()):
+            if not future.done():
+                continue
+            try:
+                deleted = bool(future.result())
+            except Exception as e:
+                logger.error(f"Async checkpoint deletion failed for {ckpt_dir}: {e}")
+                deleted = False
+            del self._pending_delete_futures[ckpt_dir]
+            if deleted:
+                if ckpt_dir in self.saved_ckpt_step_dirs:
+                    self.saved_ckpt_step_dirs.remove(ckpt_dir)
+            else:
+                logger.warning(
+                    f"Checkpoint deletion failed; retaining it for retry: {ckpt_dir}"
+                )
+
+    def _finalize_pending_save_checks(self) -> bool:
+        """Apply async save checks only after every saving rank is complete."""
+        if not self._is_master_rank():
+            return False
+
+        finalized_any = False
+        remaining_save_checks = []
+        for step, kwargs in self._pending_save_checks:
+            step_ckpt_path = os.path.join(self.ckpt_output_dir, f"step_{step}")
+            policy_path = os.path.join(step_ckpt_path, "policy")
+            if not self.ckpt_path_check(policy_path):
+                remaining_save_checks.append((step, kwargs))
+                continue
+
+            self._apply_save_check(step, **kwargs)
+            finalized_any = True
+
+        self._pending_save_checks = remaining_save_checks
+        return finalized_any
+
+    def _enforce_checkpoint_retention(self, async_delete: bool = True):
+        """Prune to ``max_keep`` while protecting the current best checkpoint."""
+        if self.max_keep == -1:
+            return
+
+        self._reconcile_pending_checkpoint_deletes()
+        pending_delete_dirs = set(self._pending_delete_futures)
+        pending_save_dirs = {
+            os.path.join(self.ckpt_output_dir, f"step_{step}")
+            for step, _ in self._pending_save_checks
+        }
+
+        def _retained_checkpoint_count():
+            return sum(
+                ckpt_dir not in pending_delete_dirs
+                and ckpt_dir not in pending_save_dirs
+                for ckpt_dir in self.saved_ckpt_step_dirs
+            )
+
+        while _retained_checkpoint_count() > self.max_keep:
+            step_to_delete = next(
+                (
+                    ckpt_dir
+                    for ckpt_dir in self.saved_ckpt_step_dirs
+                    if ckpt_dir not in pending_delete_dirs
+                    and ckpt_dir not in pending_save_dirs
+                    and not self._is_ckpt_dir_linked_as_best(ckpt_dir)
+                ),
+                None,
+            )
+            if step_to_delete is None:
+                break
+
+            oldest_dir = self.saved_ckpt_step_dirs[0]
+            if self._is_ckpt_dir_linked_as_best(oldest_dir):
+                logger.info(
+                    f"Best checkpoint is at {oldest_dir}, "
+                    f"deleting {step_to_delete} instead"
+                )
+            else:
+                logger.info(f"Deleting {step_to_delete}")
+
+            if async_delete and self.save_mode == "async" and hasattr(self, "executor"):
+                delete_future = self.executor.submit(
+                    self._delete_checkpoint, step_to_delete
+                )
+                self._pending_delete_futures[step_to_delete] = delete_future
+                self.pre_save_futures.append(delete_future)
+                pending_delete_dirs.add(step_to_delete)
+            else:
+                if self._delete_checkpoint(step_to_delete):
+                    self.saved_ckpt_step_dirs.remove(step_to_delete)
+                else:
+                    logger.warning(
+                        f"Checkpoint deletion failed; retaining it for retry: "
+                        f"{step_to_delete}"
+                    )
+                    break
 
     @staticmethod
     def get_rng_state():
@@ -429,6 +593,9 @@ class CheckpointMananger:
                 except Exception as e:
                     logger.error(f"Async checkpoint save/upload failed: {e}")
             self.pre_save_futures = []
+        self._reconcile_pending_checkpoint_deletes()
+        if self._finalize_pending_save_checks():
+            self._enforce_checkpoint_retention(async_delete=False)
         self.executor.shutdown(wait=True)
 
     def save_checkpoint(
@@ -520,6 +687,7 @@ class CheckpointMananger:
         )
 
         if self.save_mode == "async":
+            finalized_previous_save = False
 
             def _write_complete_marker_after_saves(futures_to_wait, marker_path):
                 """Wait for all save futures to complete, then write the complete marker."""
@@ -533,7 +701,9 @@ class CheckpointMananger:
             if len(self.pre_save_futures) > 0:
                 for future in futures.as_completed(self.pre_save_futures):
                     future.result()
+                self._reconcile_pending_checkpoint_deletes()
                 self.pre_save_futures = []
+            finalized_previous_save = self._finalize_pending_save_checks()
 
             # offload the state dict to CPU
             model_state_dict_cpu = self.offload_state_dict_cpu(state_dict)
@@ -585,9 +755,15 @@ class CheckpointMananger:
             # Track all futures (saves + complete marker)
             self.pre_save_futures = save_futures + [complete_marker_future]
 
+            # Retention for the previous checkpoint starts only after its local
+            # writes and every expected rank marker have been validated above.
+            if finalized_previous_save:
+                self._enforce_checkpoint_retention()
+
             if is_final:
                 # wait for all futures to complete before returning for final save
                 futures.wait(self.pre_save_futures)
+                self._reconcile_pending_checkpoint_deletes()
                 self.pre_save_futures = []
         else:  # sync
             _save_upload(state_dict, model_ckpt_path, is_final)
@@ -756,76 +932,85 @@ class CheckpointMananger:
 
         raise FileNotFoundError(f"No checkpoint found at {base_paths}")
 
+    def _apply_save_check(self, step: int, **kwargs):
+        """Update best-checkpoint metadata for a confirmed durable checkpoint."""
+        step_ckpt_path = os.path.join(self.ckpt_output_dir, f"step_{step}")
+        val_score = kwargs.get("val_score", None)
+        if val_score is None:
+            return
+
+        step_ckpt_abs_dir = os.path.abspath(step_ckpt_path)
+        if not self._best_score_known:
+            if step_ckpt_abs_dir == self.best_ckpt_abs_dir:
+                # Explicitly re-evaluating the recovered best restores the
+                # score needed for safe comparisons with later checkpoints.
+                self.best_score = val_score
+                self._best_score_known = True
+                self._save_best_score(val_score, step_ckpt_path)
+            else:
+                # A score from another checkpoint cannot be compared with an
+                # unknown prior-best score. Conservatively retain the valid
+                # recovered target instead of replacing and pruning it.
+                logger.warning(
+                    "Best checkpoint score metadata is unavailable; retaining "
+                    f"the recovered best checkpoint {self.best_ckpt_abs_dir} "
+                    f"instead of comparing it with step_{step}"
+                )
+            return
+
+        is_improved = ("loss" in self.metric and val_score < self.best_score) or (
+            "loss" not in self.metric and val_score > self.best_score
+        )
+        if not is_improved:
+            return
+
+        self.best_score = val_score
+        self.best_ckpt_abs_dir = step_ckpt_abs_dir
+
+        best_dir = self._best_dir
+        os.makedirs(best_dir, exist_ok=True)
+
+        # Create symlink for checkpoint at root/best/checkpoints
+        best_ckpt_link = os.path.join(best_dir, "checkpoints")
+        self._replace_symlink(step_ckpt_path, best_ckpt_link)
+        logger.info(f"Best checkpoint updated to step_{step} with score: {val_score}")
+
+        # Create symlink for safetensors at root/best/safetensors
+        if self.config.train.ckpt.export_safetensors:
+            best_safetensors_link = os.path.join(best_dir, "safetensors")
+            step_safetensors_path = os.path.join(
+                self.config.train.output_dir, "safetensors", f"step_{step}"
+            )
+            self._replace_symlink(step_safetensors_path, best_safetensors_link)
+            logger.info(f"Best safetensors updated to step_{step}")
+
+        # Save best score to file for persistence across resumes
+        self._save_best_score(val_score, step_ckpt_path)
+
     def save_check(self, step: int, **kwargs):
-        if self._is_master_rank():
-            step_ckpt_path = os.path.join(self.ckpt_output_dir, f"step_{step}")
+        if not self._is_master_rank():
+            return
+
+        step_ckpt_path = os.path.join(self.ckpt_output_dir, f"step_{step}")
+        if step_ckpt_path not in self.saved_ckpt_step_dirs:
             self.saved_ckpt_step_dirs.append(step_ckpt_path)
-            # remove the old checkpoints
-            # expected behavior:
-            # Keep the best checkpoint, and delete the oldest checkpoint if the number of
-            # checkpoints exceeds the max_keep.
-            # If the best checkpoint is the oldest checkpoint, delete the second oldest checkpoint.
-            if len(self.saved_ckpt_step_dirs) > self.max_keep and self.max_keep != -1:
-                oldest_dir = self.saved_ckpt_step_dirs[0]  # peek
-                step_to_delete = None
 
-                if (
-                    self._is_ckpt_dir_linked_as_best(oldest_dir)
-                    and len(self.saved_ckpt_step_dirs) > 1
-                ):
-                    # Best is oldest, delete second oldest instead
-                    self.saved_ckpt_step_dirs.pop(0)  # remove best temporarily
-                    step_to_delete = self.saved_ckpt_step_dirs.pop(0)
-                    self.saved_ckpt_step_dirs.insert(0, oldest_dir)  # put best back
-                    logger.info(
-                        f"Best checkpoint is at {oldest_dir}, "
-                        f"deleting {step_to_delete} instead"
-                    )
-                else:
-                    step_to_delete = self.saved_ckpt_step_dirs.pop(0)
-                    logger.info(f"Deleting {step_to_delete}")
+        if self.save_mode == "async":
+            # Async writes may still fail (for example with ENOSPC) after this
+            # method returns. Keep the old best and defer retention until every
+            # expected saving-rank completion marker exists.
+            pending_check = (step, dict(kwargs))
+            for index, (pending_step, _) in enumerate(self._pending_save_checks):
+                if pending_step == step:
+                    self._pending_save_checks[index] = pending_check
+                    break
+            else:
+                self._pending_save_checks.append(pending_check)
+            if not self.pre_save_futures and self._finalize_pending_save_checks():
+                self._enforce_checkpoint_retention(async_delete=False)
+            return
 
-                if step_to_delete is not None:
-                    if self.save_mode == "async" and hasattr(self, "executor"):
-                        self.pre_save_futures.append(
-                            self.executor.submit(
-                                self._delete_checkpoint, step_to_delete
-                            )
-                        )
-                    else:
-                        self._delete_checkpoint(step_to_delete)
-
-            val_score = kwargs.get("val_score", None)
-            if val_score is not None:
-                if ("loss" in self.metric and val_score < self.best_score) or (
-                    "loss" not in self.metric and val_score > self.best_score
-                ):
-                    self.best_score = val_score
-                    self.best_ckpt_abs_dir = os.path.abspath(step_ckpt_path)
-
-                    best_dir = self._best_dir
-                    os.makedirs(best_dir, exist_ok=True)
-
-                    # Create symlink for checkpoint at root/best/checkpoints
-                    best_ckpt_link = os.path.join(best_dir, "checkpoints")
-                    # assume the best checkpoint is at self.ckpt_output_dir/step_<step>
-                    if os.path.islink(best_ckpt_link):
-                        os.unlink(best_ckpt_link)
-                    os.symlink(step_ckpt_path, best_ckpt_link)
-                    logger.info(
-                        f"Best checkpoint updated to step_{step} with score: {val_score}"
-                    )
-
-                    # Create symlink for safetensors at root/best/safetensors
-                    if self.config.train.ckpt.export_safetensors:
-                        best_safetensors_link = os.path.join(best_dir, "safetensors")
-                        step_safetensors_path = os.path.join(
-                            self.config.train.output_dir, "safetensors", f"step_{step}"
-                        )
-                        if os.path.islink(best_safetensors_link):
-                            os.unlink(best_safetensors_link)
-                        os.symlink(step_safetensors_path, best_safetensors_link)
-                        logger.info(f"Best safetensors updated to step_{step}")
-
-                    # Save best score to file for persistence across resumes
-                    self._save_best_score(val_score, step_ckpt_path)
+        # Sync saves are durable when save_checkpoint returns. Update best before
+        # applying retention so a newly improved checkpoint is protected.
+        self._apply_save_check(step, **kwargs)
+        self._enforce_checkpoint_retention()
