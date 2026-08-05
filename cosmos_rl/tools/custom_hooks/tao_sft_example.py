@@ -26,7 +26,8 @@ Usage:
 
 Environment Variables for TAO logging:
     TAO_API_JOB_ID: Job ID for status file path
-    TAO_API_RESULTS_DIR: Results directory (defaults to /results)
+    TAO_API_RESULTS_DIR: User-supplied results directory
+    TAO_STATUS_FILE: Explicit status file path (preferred for direct launches)
 
 The status file is written to: {TAO_API_RESULTS_DIR}/{TAO_API_JOB_ID}/status.json
 """
@@ -93,6 +94,10 @@ class CustomConfig(pydantic.BaseModel):
 
     system_prompt: str = pydantic.Field(default="")
     """System prompt."""
+
+    video_decoder: pydantic.StrictStr = "pynvvideocodec"
+    video_cache_size: int = pydantic.Field(default=2, ge=0)
+    video_override_map: str | None = None
 
     vision: VisionConfig = pydantic.Field(
         default=VisionConfig(
@@ -187,13 +192,13 @@ class CustomDataset(torch.utils.data.Dataset):
         return conversations
 
 
-def _get_results_dir() -> str:
+def _get_results_dir() -> str | None:
     """Get the results directory based on TAO environment variables."""
     job_id = os.environ.get("TAO_API_JOB_ID")
-    if job_id:
-        results_base = os.environ.get("TAO_API_RESULTS_DIR", "/results")
+    results_base = os.environ.get("TAO_API_RESULTS_DIR")
+    if job_id and results_base:
         return os.path.join(results_base, job_id)
-    return "./results"
+    return None
 
 
 def _is_master_rank() -> bool:
@@ -224,8 +229,9 @@ def monitor_status(experiment_name: str = "Cosmos-RL finetuning"):
             s_logger = None
 
             # Only setup logger on master rank
-            if HAS_TAO_CORE and _is_master_rank():
+            if HAS_TAO_CORE and _is_master_rank() and _get_results_dir() is not None:
                 results_dir = _get_results_dir()
+                assert results_dir is not None
                 os.makedirs(results_dir, exist_ok=True)
                 status_file = os.path.join(results_dir, "status.json")
 
@@ -251,7 +257,7 @@ def monitor_status(experiment_name: str = "Cosmos-RL finetuning"):
                 # Log SUCCESS
                 if s_logger:
                     s_logger.write(
-                        status_level=Status.RUNNING,
+                        status_level=Status.SUCCESS,
                         message=f"{experiment_name} training completed successfully",
                     )
                     logger.info(f"Job SUCCESS: {experiment_name}")
@@ -302,6 +308,16 @@ def main():
         config_kwargs = toml.load(f)
     config = cosmos_rl.policy.config.Config.from_dict(config_kwargs)
     custom_config = CustomConfig.model_validate(config_kwargs.get("custom", {}))
+    if custom_config.video_decoder == "pynvvideocodec" and os.environ.get("COSMOS_ROLE") != "Controller":
+        from cosmos_rl.utils.pynv_video_reader import register_pynv_video_reader
+
+        decoder_info = register_pynv_video_reader(
+            cache_size=custom_config.video_cache_size,
+            video_override_map=custom_config.video_override_map,
+        )
+        logger.info("GPU video decoder registered: %s", decoder_info)
+    elif custom_config.video_decoder not in {"pynvvideocodec", "cpu"}:
+        raise ValueError("custom.video_decoder must be pynvvideocodec or cpu")
 
     # Save config if controller
     role = os.environ.get("COSMOS_ROLE")

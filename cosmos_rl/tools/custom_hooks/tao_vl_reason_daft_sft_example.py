@@ -122,6 +122,9 @@ class CustomConfig(pydantic.BaseModel):
     train_dataset: CustomDatasetConfig = pydantic.Field()
     val_dataset: CustomDatasetConfig | None = None
     system_prompt: str = ""
+    video_decoder: Literal["pynvvideocodec", "cpu"] = "pynvvideocodec"
+    video_cache_size: int = pydantic.Field(default=2, ge=0)
+    video_override_map: str | None = None
     vision: VisionConfig = pydantic.Field(
         default=VisionConfig(
             fps=1,
@@ -213,11 +216,12 @@ class CustomDataset(torch.utils.data.Dataset):
         return self.dataset[dataset_index]
 
 
-def _get_results_dir() -> str:
+def _get_results_dir() -> str | None:
     job_id = os.environ.get("TAO_API_JOB_ID")
-    if job_id:
-        return os.path.join(os.environ.get("TAO_API_RESULTS_DIR", "/results"), job_id)
-    return "./results"
+    results_base = os.environ.get("TAO_API_RESULTS_DIR")
+    if job_id and results_base:
+        return os.path.join(results_base, job_id)
+    return None
 
 
 def _is_master_rank() -> bool:
@@ -260,10 +264,11 @@ def monitor_status(name: str = "Cosmos-RL", mode: str = "sft"):
             status_logger = None
             if _is_master_rank():
                 results_dir = _get_results_dir()
-                os.makedirs(results_dir, exist_ok=True)
-                status_file = os.path.join(results_dir, "status.json")
+                if results_dir is not None:
+                    os.makedirs(results_dir, exist_ok=True)
+                    status_file = os.path.join(results_dir, "status.json")
 
-                if HAS_TAO_CORE:
+                if status_file is not None and HAS_TAO_CORE:
                     status_logger = StatusLogger(
                         filename=status_file,
                         is_master=True,
@@ -275,7 +280,7 @@ def monitor_status(name: str = "Cosmos-RL", mode: str = "sft"):
                         status_level=Status.STARTED,
                         message=f"Starting {name} {mode}",
                     )
-                else:
+                elif status_file is not None:
                     _write_fallback_status(
                         status_file,
                         "STARTED",
@@ -369,6 +374,14 @@ def main():
         config_kwargs = toml.load(f)
     config = cosmos_rl.policy.config.Config.from_dict(config_kwargs)
     custom_config = CustomConfig.model_validate(config_kwargs.get("custom", {}))
+    if custom_config.video_decoder == "pynvvideocodec" and os.environ.get("COSMOS_ROLE") != "Controller":
+        from cosmos_rl.utils.pynv_video_reader import register_pynv_video_reader
+
+        decoder_info = register_pynv_video_reader(
+            cache_size=custom_config.video_cache_size,
+            video_override_map=custom_config.video_override_map,
+        )
+        logger.info("GPU video decoder registered: %s", decoder_info)
 
     if os.environ.get("COSMOS_ROLE") == "Controller":
         output_dir = Path(config.train.output_dir).resolve().parent

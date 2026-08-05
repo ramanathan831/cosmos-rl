@@ -7,25 +7,17 @@ system_prompt = "You are a helpful assistant that can answer questions about str
 
 [custom.train_dataset]
 annotation_path = [
-    "/lustre/fsw/portfolios/edgeai/users/yilzhao/workspace/releases/20260501/workspace/aetc-tao-vl-reason-v1.0/bcq_openended.json",
-    "/lustre/fsw/portfolios/edgeai/users/yilzhao/workspace/releases/20260501/workspace/aetc-tao-vl-reason-v1.0/bcq.json",
-    "/lustre/fsw/portfolios/edgeai/users/yilzhao/workspace/releases/20260501/workspace/aetc-tao-vl-reason-v1.0/mcq_openended.json",
-    "/lustre/fsw/portfolios/edgeai/users/yilzhao/workspace/releases/20260501/workspace/aetc-tao-vl-reason-v1.0/mcq.json",
-    "/lustre/fsw/portfolios/edgeai/users/yilzhao/workspace/releases/20260501/workspace/aetc-tao-vl-reason-v1.0/open_qa.json",
-    "/lustre/fsw/portfolios/edgeai/users/yilzhao/workspace/releases/20260501/workspace/aetc-tao-vl-reason-v1.0/scene_description.json",
-    "/lustre/fsw/portfolios/edgeai/users/yilzhao/workspace/releases/20260501/workspace/aetc-tao-vl-reason-v1.0/video_summarization.json",
-    "/lustre/fsw/portfolios/edgeai/users/yilzhao/workspace/releases/20260501/workspace/aetc-tao-vl-reason-v1.0/temporal_localization.json",
-    "/lustre/fsw/portfolios/edgeai/users/yilzhao/workspace/releases/20260501/workspace/aetc-tao-vl-reason-v1.0/temporal_description.json",
-    "/lustre/fsw/portfolios/edgeai/users/yilzhao/workspace/releases/20260501/workspace/aetc-tao-vl-reason-v1.0/causal_linkage.json",
+    "__AETC_TRAIN_ANNOTATION_PATH__",
 ]
+media_root = ["__AETC_TRAIN_MEDIA_ROOT__"]
 response_mode = "hybrid"
 max_samples = 512
 
 [custom.val_dataset]
 annotation_path = [
-    "/lustre/fsw/portfolios/edgeai/users/yilzhao/workspace/releases/20260501/workspace/aetc-tao-vl-reason-v1.0-eval/bcq.json",
-    "/lustre/fsw/portfolios/edgeai/users/yilzhao/workspace/releases/20260501/workspace/aetc-tao-vl-reason-v1.0-eval/mcq.json",
+    "__AETC_VALIDATION_ANNOTATION_PATH__",
 ]
+media_root = ["__AETC_VALIDATION_MEDIA_ROOT__"]
 response_mode = "answer"
 max_samples = 64
 
@@ -38,7 +30,7 @@ max_pixels = 186625
 resume = false
 epoch = 1
 timestamp = "aetc_daft_subsample"
-output_dir = "./outputs/aetc_tao_vl_reason_daft"
+output_dir = "__CHECKPOINT_DIR__"
 epsilon = 1e-6
 optm_name = "AdamW"
 optm_lr = 1e-5
@@ -66,7 +58,7 @@ dataloader_prefetch_factor = 1
 enable_dataset_cache = false
 
 [policy]
-model_name_or_path = "/models/Cosmos-Reason2-8B-Private"
+model_name_or_path = "__BASE_MODEL_PATH_OR_URI__"
 model_max_length = 81920
 model_gradient_checkpointing = true
 

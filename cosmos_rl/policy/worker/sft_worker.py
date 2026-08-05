@@ -15,6 +15,7 @@
 
 
 import inspect
+import json
 import os
 import atexit
 import traceback as _tb
@@ -98,16 +99,56 @@ class SFTDataset(Dataset):
             # It's not stable yet, we only checked if the config is the same
             # If there are any problems, it is recommended that the user clears the cache folder
             # Use cache_prefix to ensure train and val have separate cache folders
-            cache_folder = os.path.join(
-                os.environ.get(
-                    "COSMOS_CACHE",
-                    os.path.join(os.path.expanduser("~"), ".cache/cosmos/"),
-                ),
-                "datasets_cache",
-                f"{cache_prefix}-{self.config.dataset.name}-{config_hash(config)}",
+            explicit_root = getattr(self.config, "dataset_cache_dir", None)
+            fingerprint = (
+                getattr(self.config, "validation_dataset_cache_fingerprint", None)
+                if cache_prefix == "val"
+                else getattr(self.config, "dataset_cache_fingerprint", None)
             )
+            if cache_prefix == "val" and fingerprint is None:
+                fingerprint = getattr(self.config, "dataset_cache_fingerprint", None)
+            if explicit_root:
+                if not fingerprint:
+                    raise ValueError("dataset_cache_fingerprint is required with dataset_cache_dir")
+                cache_folder = os.path.join(
+                    os.path.realpath(os.path.expanduser(explicit_root)),
+                    f"{cache_prefix}-{fingerprint}",
+                )
+            else:
+                cache_folder = os.path.join(
+                    os.environ.get(
+                        "COSMOS_CACHE",
+                        os.path.join(os.path.expanduser("~"), ".cache/cosmos/"),
+                    ),
+                    "datasets_cache",
+                    f"{cache_prefix}-{self.config.dataset.name}-{config_hash(config)}",
+                )
             logger.info(f"SFTDataset Cache folder ({cache_prefix}): {cache_folder}")
             self.cache = cache.DiskCache(cache_folder)
+            if getattr(self.config, "require_complete_dataset_cache", False):
+                manifest_path = os.path.join(cache_folder, "cache_provenance.json")
+                if not os.path.isfile(manifest_path):
+                    raise RuntimeError(f"Required cache provenance is missing: {manifest_path}")
+                with open(manifest_path, encoding="utf-8") as manifest_file:
+                    manifest = json.load(manifest_file)
+                expected = {
+                    "split": cache_prefix,
+                    "cache_fingerprint": fingerprint,
+                    "record_count": len(self.dataset),
+                    "complete": True,
+                }
+                mismatches = {
+                    key: {"expected": value, "actual": manifest.get(key)}
+                    for key, value in expected.items()
+                    if manifest.get(key) != value
+                }
+                if mismatches:
+                    raise RuntimeError(f"Dataset cache provenance mismatch: {mismatches}")
+                missing = [idx for idx in range(len(self.dataset)) if not os.path.isfile(self.cache.path_for(idx))]
+                if missing:
+                    raise RuntimeError(
+                        f"Dataset cache is incomplete: {len(missing)} missing entries; first={missing[:10]}"
+                    )
         else:
             logger.info(f"SFTDataset cache disabled for {cache_prefix}")
 
@@ -886,8 +927,8 @@ class SFTPolicyWorker(PolicyWorkerBase):
 
         # validation
         logger.info(f"Validation at step {self.train_step}/{self.total_steps}...")
-        val_total_loss = 0.0
-        val_total_samples = 0
+        val_loss_numerator = 0.0
+        val_loss_denominator = 0
 
         for batch_index, val_global_batch in enumerate(
             tqdm(
@@ -902,17 +943,15 @@ class SFTPolicyWorker(PolicyWorkerBase):
                 }
                 self.pre_per_step_validation_hook(self, report_data=report_data)
 
-            val_score = self.trainer.step_validation(
+            val_stats = self.trainer.step_validation(
                 val_global_batch, self.train_step, self.total_steps
             )
 
-            # Track samples processed in this batch
-            batch_samples = len(val_global_batch)
-            avg_batch_loss = val_score / batch_samples if batch_samples > 0 else 0.0
+            avg_batch_loss = val_stats["avg_loss"]
 
             logger.debug(
                 f"[SFT] Validation batch {batch_index}: rank={self.global_rank}, "
-                f"loss={avg_batch_loss:.6f}, samples={batch_samples}"
+                f"loss={avg_batch_loss:.6f}, valid_tokens={val_stats['loss_denominator']}"
             )
 
             # Call post_per_step_validation_hook
@@ -921,27 +960,25 @@ class SFTPolicyWorker(PolicyWorkerBase):
                     "current_epoch": current_epoch,
                     "batch_index": batch_index,
                     "val_score": avg_batch_loss,
-                    "batch_samples": batch_samples,
+                    "loss_numerator": val_stats["loss_numerator"],
+                    "loss_denominator": val_stats["loss_denominator"],
                 }
                 self.post_per_step_validation_hook(self, report_data=report_data)
 
-            val_total_loss += val_score
-            val_total_samples += batch_samples
+            val_loss_numerator += val_stats["loss_numerator"]
+            val_loss_denominator += val_stats["loss_denominator"]
 
-        # len(self.val_data_loader.dataset) gives the total number of samples
-        # across all ranks, so no all_reduce is needed for sample counts.
-        # val_total_loss is already globally synchronized from trainer's
-        # dist_mean * dp_size in step_validation().
-        total_dataset_samples = len(self.val_data_loader.dataset)
-        val_avg_loss = (
-            val_total_loss / total_dataset_samples if total_dataset_samples > 0 else 0.0
-        )
+        if val_loss_denominator <= 0:
+            raise RuntimeError("Validation produced zero valid labels; refusing to report a loss")
+        val_avg_loss = val_loss_numerator / val_loss_denominator
 
         # Call post_validation_hook
         if self.post_validation_hook is not None:
             report_data = {
                 "current_epoch": current_epoch,
                 "val_avg_loss": val_avg_loss,
+                "val_loss_numerator": val_loss_numerator,
+                "val_loss_denominator": val_loss_denominator,
             }
             self.post_validation_hook(self, report_data=report_data)
 
@@ -949,6 +986,9 @@ class SFTPolicyWorker(PolicyWorkerBase):
         report_data = {
             "val/cur_epoch": current_epoch + 1,  # 1-indexed
             "val/avg_loss": val_avg_loss,
+            "val/loss_numerator": val_loss_numerator,
+            "val/loss_denominator": val_loss_denominator,
+            "val/valid_label_count": val_loss_denominator,
             "val/train_epochs": self.epoch,
             "val/total_steps": self.total_steps,  # This total_steps is for training
             "val/train_step": self.train_step,
@@ -957,7 +997,7 @@ class SFTPolicyWorker(PolicyWorkerBase):
         if util.is_master_rank(self.parallel_dims, self.global_rank):
             logger.info(
                 f"[SFT] Validation rank {self.global_rank}: avg_loss={val_avg_loss:.6f}, "
-                f"samples={val_total_samples}"
+                f"valid_tokens={val_loss_denominator}"
             )
 
             logger.info(
@@ -976,6 +1016,7 @@ class SFTPolicyWorker(PolicyWorkerBase):
 
         # Track when we last validated to avoid duplicates
         self._last_validation_step = self.train_step
+        self._last_validation_loss = val_avg_loss
 
         return val_avg_loss
 
@@ -1096,6 +1137,8 @@ class SFTPolicyWorker(PolicyWorkerBase):
             )
 
         cur_epoch = self.start_epoch
+        train_loss_numerator = 0.0
+        train_loss_denominator = 0
         # Call pre_training_hook before training starts
         if self.pre_training_hook is not None:
             pre_training_data = {
@@ -1103,6 +1146,7 @@ class SFTPolicyWorker(PolicyWorkerBase):
                 "total_steps": self.total_steps,
                 "start_epoch": self.start_epoch,
                 "start_step": self.train_step,
+                "parameter_summary": getattr(getattr(self.trainer, "model", None), "parameter_summary", None),
             }
             self.pre_training_hook(self, report_data=pre_training_data)
 
@@ -1166,6 +1210,8 @@ class SFTPolicyWorker(PolicyWorkerBase):
                     data_arrival_event=data_arrival_event,
                 )
                 report_data["train/epoch"] = cur_epoch
+                train_loss_numerator += float(report_data["train/loss_numerator"])
+                train_loss_denominator += int(report_data["train/loss_denominator"])
 
                 self.train_step += 1
 
@@ -1214,7 +1260,7 @@ class SFTPolicyWorker(PolicyWorkerBase):
                     current_epoch=cur_epoch, is_last_step=False
                 )
 
-                self.trainer.checkpointing(
+                checkpoint_event = self.trainer.checkpointing(
                     total_steps=self.total_steps,
                     train_step=self.train_step,
                     save_freq=self._save_freq,
@@ -1223,6 +1269,9 @@ class SFTPolicyWorker(PolicyWorkerBase):
                     val_score=val_avg_loss,
                     steps_per_epoch=len(self.train_data_loader),
                 )
+                if checkpoint_event and util.is_master_rank(self.parallel_dims, self.global_rank):
+                    for custom_logger_fn in self.custom_logger_fns:
+                        custom_logger_fn(checkpoint_event, self.train_step)
 
                 self.profiler.step()
                 data_arrival_event = torch.cuda.Event(enable_timing=True)
@@ -1252,7 +1301,7 @@ class SFTPolicyWorker(PolicyWorkerBase):
             logger.info(
                 f"Skipping final validation - already validated at step {self.train_step}"
             )
-            val_avg_loss = None
+            val_avg_loss = getattr(self, "_last_validation_loss", None)
 
         # Check if we already saved at this step during regular checkpointing
         already_saved_at_final_step = (
@@ -1263,7 +1312,7 @@ class SFTPolicyWorker(PolicyWorkerBase):
         )
 
         if not already_saved_at_final_step:
-            self.trainer.checkpointing(
+            checkpoint_event = self.trainer.checkpointing(
                 total_steps=self.total_steps,
                 train_step=self.train_step,
                 save_freq=self._save_freq,
@@ -1272,6 +1321,9 @@ class SFTPolicyWorker(PolicyWorkerBase):
                 val_score=val_avg_loss,
                 steps_per_epoch=len(self.train_data_loader),
             )
+            if checkpoint_event and util.is_master_rank(self.parallel_dims, self.global_rank):
+                for custom_logger_fn in self.custom_logger_fns:
+                    custom_logger_fn(checkpoint_event, self.train_step)
         else:
             logger.info(
                 f"Skipping final checkpoint - already saved at step {self.train_step}"
@@ -1279,13 +1331,34 @@ class SFTPolicyWorker(PolicyWorkerBase):
 
         # Call post_training_hook after training completes
         if self.post_training_hook is not None:
+            if train_loss_denominator <= 0:
+                raise RuntimeError("Training produced zero valid labels; refusing to report a loss")
             post_training_data = {
                 "final_epoch": cur_epoch,
                 "final_step": self.train_step,
                 "total_steps": self.total_steps,
                 "final_val_loss": val_avg_loss,
+                "train_avg_loss": train_loss_numerator / train_loss_denominator,
+                "train_loss_numerator": train_loss_numerator,
+                "train_loss_denominator": train_loss_denominator,
             }
             self.post_training_hook(self, report_data=post_training_data)
+
+        if train_loss_denominator <= 0:
+            raise RuntimeError("Training produced zero valid labels; refusing to report a loss")
+        complete_metrics = {
+            "train/avg_loss": train_loss_numerator / train_loss_denominator,
+            "train/loss_numerator": train_loss_numerator,
+            "train/loss_denominator": train_loss_denominator,
+            "train/valid_label_count": train_loss_denominator,
+            "train/total_steps": self.total_steps,
+            "train/total_epochs": self.epoch,
+        }
+        if val_avg_loss is not None:
+            complete_metrics["val/avg_loss"] = val_avg_loss
+        if util.is_master_rank(self.parallel_dims, self.global_rank):
+            for custom_logger_fn in self.custom_logger_fns:
+                custom_logger_fn(complete_metrics, self.train_step)
 
     def handle_shutdown(self):
         # handle the ckpt saving

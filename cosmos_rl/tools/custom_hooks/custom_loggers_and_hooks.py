@@ -425,14 +425,18 @@ class TAOStatusLogger:
         """
         if self._status_file_path:
             return self._status_file_path
+        if os.environ.get("TAO_STATUS_FILE"):
+            return os.environ["TAO_STATUS_FILE"]
 
         job_id = os.environ.get("TAO_API_JOB_ID")
         if not job_id:
             logger.debug("TAO_API_JOB_ID not set, skipping status.json logging")
             return None
 
-        # Use TAO_API_RESULTS_DIR for SLURM compatibility, fallback to /results
-        results_base = os.environ.get("TAO_API_RESULTS_DIR", "/results")
+        results_base = os.environ.get("TAO_API_RESULTS_DIR")
+        if not results_base:
+            logger.warning("TAO_API_RESULTS_DIR is required when TAO_API_JOB_ID is set")
+            return None
         results_dir = os.path.join(results_base, job_id)
         os.makedirs(results_dir, exist_ok=True)
         return os.path.join(results_dir, "status.json")
@@ -538,11 +542,23 @@ class TAOStatusLogger:
             }
 
             # Create summary message based on available metrics
-            if "train/loss_avg" in report_data:
+            if "checkpoint/event" in report_data:
+                message = (
+                    f"Checkpoint {report_data['checkpoint/event']}: "
+                    f"{report_data.get('checkpoint/identifier', 'unknown')}"
+                )
+                tao_data["phase"] = f"checkpoint_{report_data['checkpoint/event']}"
+                tao_data["checkpoint_path"] = report_data.get("checkpoint/path")
+            elif "train/avg_loss" in report_data:
+                message = f"Training complete - token-weighted loss: {report_data['train/avg_loss']:.6f}"
+                tao_data["phase"] = "training_complete"
+            elif "train/loss_avg" in report_data:
                 message = f"Training {log_key} {current_value}/{max_value} - Loss: {report_data['train/loss_avg']:.6f}"
             elif "val/loss" in report_data or "val/avg_loss" in report_data:
                 val_loss = report_data.get("val/loss", report_data.get("val/avg_loss"))
                 message = f"Validation {log_key} {current_value}/{max_value} - Loss: {val_loss:.6f}"
+                if "val/loss_numerator" in report_data:
+                    tao_data["phase"] = "validation_complete"
             else:
                 message = f"{self.experiment_name} in progress"
 
@@ -671,11 +687,23 @@ class TAOStatusLogger:
                 f"Validation complete. Avg loss: {report_data.get('val_avg_loss', 'N/A')}",
             )
 
+        def pre_training_hook(worker, report_data: Dict[str, Any]) -> None:
+            self._write_status("training_starting", report_data)
+
+        def post_training_hook(worker, report_data: Dict[str, Any]) -> None:
+            self._write_status(
+                "training_complete",
+                report_data,
+                f"Training complete. Avg loss: {report_data.get('train_avg_loss', 'N/A')}",
+            )
+
         return {
             "pre_validation_hook": pre_validation_hook,
             "pre_per_step_validation_hook": pre_per_step_validation_hook,
             "post_per_step_validation_hook": post_per_step_validation_hook,
             "post_validation_hook": post_validation_hook,
+            "pre_training_hook": pre_training_hook,
+            "post_training_hook": post_training_hook,
         }
 
 
