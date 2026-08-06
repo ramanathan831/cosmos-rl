@@ -45,6 +45,9 @@ def register_pynv_video_reader(
         if not isinstance(value, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in value.items()):
             raise ValueError("video_override_map must be a JSON object of string paths")
         overrides = value
+    scanned_metadata_paths = {
+        str(Path(item).expanduser().resolve(strict=True)) for item in overrides.values()
+    }
 
     video_cache: OrderedDict[tuple[Any, ...], Any] = OrderedDict()
     decoder_lock = threading.RLock()
@@ -79,11 +82,10 @@ def register_pynv_video_reader(
                 video_path,
                 gpu_id=gpu_id,
                 use_device_memory=False,
-                # Full stream metadata is required for deterministic random
-                # access. Container header frame counts (notably WebM and
-                # MPEG-4 inputs) can be inaccurate and have caused NVDEC seek
-                # stalls under multi-rank preprocessing.
-                need_scanned_stream_metadata=True,
+                # Scan only prepared override streams. Scanning every source
+                # video turns a small smoke cache into a many-minute full
+                # stream pass and cannot meet the full-regression time limit.
+                need_scanned_stream_metadata=video_path in scanned_metadata_paths,
                 output_color_type=nvc.OutputColorType.RGB,
             )
             try:
