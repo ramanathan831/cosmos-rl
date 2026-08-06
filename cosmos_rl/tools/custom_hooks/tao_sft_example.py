@@ -48,6 +48,7 @@ from cosmos_rl.utils.logging import logger
 
 # Import TAO status logger utilities
 from cosmos_rl.tools.custom_hooks import TAOStatusLogger
+from cosmos_rl.tools.custom_hooks.lifecycle_status import append_terminal_status
 
 # Import TAO core logging for STARTED/SUCCESS/FAILURE status
 try:
@@ -227,6 +228,7 @@ def monitor_status(experiment_name: str = "Cosmos-RL finetuning"):
     def decorator(func):
         def wrapper(*args, **kwargs):
             s_logger = None
+            status_file = None
 
             # Only setup logger on master rank
             if HAS_TAO_CORE and _is_master_rank() and _get_results_dir() is not None:
@@ -255,22 +257,23 @@ def monitor_status(experiment_name: str = "Cosmos-RL finetuning"):
                 result = func(*args, **kwargs)
 
                 # Log SUCCESS
-                if s_logger:
-                    s_logger.write(
-                        status_level=Status.SUCCESS,
-                        message=f"{experiment_name} training completed successfully",
+                if status_file:
+                    append_terminal_status(
+                        status_file,
+                        "SUCCESS",
+                        f"{experiment_name} training completed successfully",
                     )
                     logger.info(f"Job SUCCESS: {experiment_name}")
 
                 return result
 
             except (KeyboardInterrupt, SystemExit) as e:
-                if s_logger:
+                if status_file:
                     try:
-                        s_logger.write(
-                            status_level=Status.FAILURE,
-                            verbosity_level=Verbosity.WARNING,
-                            message=f"{experiment_name} training was interrupted: {str(e)}",
+                        append_terminal_status(
+                            status_file,
+                            "FAILURE",
+                            f"{experiment_name} training was interrupted: {str(e)}",
                         )
                     except Exception:
                         pass
@@ -278,12 +281,12 @@ def monitor_status(experiment_name: str = "Cosmos-RL finetuning"):
                 raise
 
             except Exception as e:
-                if s_logger:
+                if status_file:
                     try:
-                        s_logger.write(
-                            status_level=Status.FAILURE,
-                            verbosity_level=Verbosity.ERROR,
-                            message=f"{experiment_name} training failed: {str(e)}",
+                        append_terminal_status(
+                            status_file,
+                            "FAILURE",
+                            f"{experiment_name} training failed: {str(e)}",
                         )
                     except Exception:
                         pass

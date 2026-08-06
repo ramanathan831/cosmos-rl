@@ -43,6 +43,7 @@ import torch.utils.data
 from cosmos_rl.dispatcher.data.packer.base import BaseDataPacker
 from cosmos_rl.dispatcher.data.packer.hf_vlm_data_packer import HFVLMDataPacker
 from cosmos_rl.tools.custom_hooks import TAOStatusLogger
+from cosmos_rl.tools.custom_hooks.lifecycle_status import append_terminal_status
 from cosmos_rl.utils.logging import logger
 
 try:
@@ -291,41 +292,24 @@ def monitor_status(name: str = "Cosmos-RL", mode: str = "sft"):
 
             try:
                 result = runner(*args, **kwargs)
-                if status_logger is not None:
-                    status_logger.write(
-                        status_level=Status.SUCCESS,
-                        message=f"{name} {mode} completed successfully",
-                    )
-                elif status_file is not None:
-                    _write_fallback_status(
+                if status_file is not None:
+                    append_terminal_status(
                         status_file,
                         "SUCCESS",
                         f"{name} {mode} completed successfully",
                     )
                 return result
             except (KeyboardInterrupt, SystemExit) as exc:
-                if status_logger is not None:
-                    status_logger.write(
-                        status_level=Status.FAILURE,
-                        verbosity_level=Verbosity.WARNING,
-                        message=f"{name} {mode} interrupted: {exc}",
-                    )
-                elif status_file is not None:
-                    _write_fallback_status(
+                if status_file is not None:
+                    append_terminal_status(
                         status_file,
                         "FAILURE",
                         f"{name} {mode} interrupted: {exc}",
                     )
                 raise
             except Exception as exc:
-                if status_logger is not None:
-                    status_logger.write(
-                        status_level=Status.FAILURE,
-                        verbosity_level=Verbosity.ERROR,
-                        message=f"{name} {mode} failed: {exc}",
-                    )
-                elif status_file is not None:
-                    _write_fallback_status(
+                if status_file is not None:
+                    append_terminal_status(
                         status_file,
                         "FAILURE",
                         f"{name} {mode} failed: {exc}",
