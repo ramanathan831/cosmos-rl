@@ -79,7 +79,11 @@ def register_pynv_video_reader(
                 video_path,
                 gpu_id=gpu_id,
                 use_device_memory=False,
-                need_scanned_stream_metadata=False,
+                # Full stream metadata is required for deterministic random
+                # access. Container header frame counts (notably WebM and
+                # MPEG-4 inputs) can be inaccurate and have caused NVDEC seek
+                # stalls under multi-rank preprocessing.
+                need_scanned_stream_metadata=True,
                 output_color_type=nvc.OutputColorType.RGB,
             )
             try:
