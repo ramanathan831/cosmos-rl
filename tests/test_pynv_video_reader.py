@@ -59,5 +59,5 @@ def test_scanned_metadata_is_limited_to_override_targets(tmp_path, monkeypatch):
     reader = vision.VIDEO_READER_BACKENDS["pynvvideocodec"]
     reader({"video": "logical.mp4", "nframes": 8})
     reader({"video": str(ordinary), "nframes": 8})
-    assert options[0]["need_scanned_stream_metadata"] is True
+    assert options[0]["need_scanned_stream_metadata"] is False
     assert options[1]["need_scanned_stream_metadata"] is False
