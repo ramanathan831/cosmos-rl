@@ -29,6 +29,10 @@ _CACHE: OrderedDict[tuple[Any, ...], tuple[torch.Tensor, dict[str, Any], float]]
 )
 _INFLIGHT: dict[tuple[Any, ...], threading.Event] = {}
 _LOCK = threading.RLock()
+# The release FFmpeg maps H.264/H.265 to CUDA decoders. Independent decoder
+# contexts created concurrently in one Python process can block each other in
+# the driver. Cache hits remain concurrent; only cold decodes are serialized.
+_DECODE_LOCK = threading.Lock()
 
 
 def _cache_key(element: dict[str, Any]) -> tuple[Any, ...]:
@@ -150,7 +154,8 @@ def read_video_system_pyav(
         event.wait()
 
     try:
-        result = _decode_sparse(element)
+        with _DECODE_LOCK:
+            result = _decode_sparse(element)
         with _LOCK:
             if _CACHE_MAX_ITEMS:
                 _CACHE[key] = result
