@@ -27,6 +27,23 @@ def combined_cache_fingerprint(dataset: str, model: str, processor: str) -> str:
     return hashlib.sha256(f"dataset={dataset}\nmodel={model}\nprocessor={processor}\n".encode()).hexdigest()
 
 
+def finish_distributed_prewarm(
+    *, rank: int, world_size: int, initialized_here: bool
+) -> bool:
+    """Close distributed coordination before rank 0 hashes cache entries.
+
+    Hashing a full video cache can exceed NCCL's collective watchdog timeout.
+    All ranks therefore synchronize once after writing their entries and then
+    tear down the process group. Rank 0 alone performs the filesystem-only
+    completeness and provenance pass with no outstanding collective.
+    """
+    if world_size > 1:
+        torch.distributed.barrier()
+    if initialized_here:
+        torch.distributed.destroy_process_group()
+    return rank == 0
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -135,9 +152,10 @@ def main() -> int:
         torch.save(value, temporary)
         os.replace(temporary, target)
 
-    if world_size > 1:
-        torch.distributed.barrier()
-    if rank == 0:
+    write_manifest = finish_distributed_prewarm(
+        rank=rank, world_size=world_size, initialized_here=initialized_here
+    )
+    if write_manifest:
         missing = [index for index in range(len(dataset)) if not entry_path(root, index).is_file()]
         if missing:
             raise RuntimeError(f"Cache prewarm incomplete: {len(missing)} missing entries; first={missing[:10]}")
@@ -159,10 +177,6 @@ def main() -> int:
         temporary = root / "cache_provenance.json.tmp"
         temporary.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         os.replace(temporary, root / "cache_provenance.json")
-    if world_size > 1:
-        torch.distributed.barrier()
-    if initialized_here:
-        torch.distributed.destroy_process_group()
     return 0
 
 
