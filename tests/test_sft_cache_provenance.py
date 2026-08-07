@@ -1,11 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import json
+
+import pytest
+
 from cosmos_rl.tools.prewarm_sft_cache import (
     cache_path,
     combined_cache_fingerprint,
     entry_path,
+    finalize_marker,
     finish_distributed_prewarm,
+    wait_for_finalize_marker,
+    write_finalize_marker,
 )
 
 
@@ -48,3 +55,35 @@ def test_nonzero_rank_does_not_write_manifest(monkeypatch) -> None:
     )
 
     assert not finish_distributed_prewarm(rank=3, world_size=8, initialized_here=True)
+
+
+def test_finalize_marker_is_job_and_split_specific(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("TAO_JOB_ID", "job-one")
+    train = finalize_marker(tmp_path, "train")
+    validation = finalize_marker(tmp_path, "val")
+    monkeypatch.setenv("TAO_JOB_ID", "job-two")
+    other_job = finalize_marker(tmp_path, "train")
+
+    assert train != validation
+    assert train != other_job
+
+
+def test_nonzero_rank_waits_for_success_marker(tmp_path) -> None:
+    marker = tmp_path / "finalize.json"
+    write_finalize_marker(marker, status="success")
+    wait_for_finalize_marker(marker, timeout_seconds=0.01)
+    assert json.loads(marker.read_text())["status"] == "success"
+
+
+def test_nonzero_rank_propagates_rank_zero_failure(tmp_path) -> None:
+    marker = tmp_path / "finalize.json"
+    write_finalize_marker(marker, status="failure", error="hash failed")
+    with pytest.raises(RuntimeError, match="hash failed"):
+        wait_for_finalize_marker(marker, timeout_seconds=0.01)
+
+
+def test_nonzero_rank_finalize_wait_times_out(tmp_path, monkeypatch) -> None:
+    marker = tmp_path / "missing.json"
+    monkeypatch.setattr("cosmos_rl.tools.prewarm_sft_cache.time.sleep", lambda _: None)
+    with pytest.raises(TimeoutError, match="Timed out"):
+        wait_for_finalize_marker(marker, timeout_seconds=0.001)

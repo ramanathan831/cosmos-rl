@@ -9,6 +9,7 @@ import argparse
 import hashlib
 import json
 import os
+import time
 from pathlib import Path
 
 import toml
@@ -42,6 +43,45 @@ def finish_distributed_prewarm(
     if initialized_here:
         torch.distributed.destroy_process_group()
     return rank == 0
+
+
+def finalize_marker(root: Path, split: str) -> Path:
+    """Return a run-specific filesystem marker used after NCCL teardown."""
+    job_id = os.environ.get("TAO_JOB_ID", "standalone")
+    token = hashlib.sha256(f"job={job_id}\nsplit={split}\n".encode()).hexdigest()[:16]
+    return root / f".prewarm-finalize-{token}.json"
+
+
+def wait_for_finalize_marker(marker: Path, timeout_seconds: float) -> None:
+    """Keep nonzero workers alive until rank 0 finishes filesystem hashing.
+
+    Multi-node torchrun may host its c10d rendezvous store on a node that does
+    not own global rank 0.  If that node's worker exits while rank 0 is still
+    hashing the cache, its local elastic agent can tear down the store and kill
+    rank 0 before the provenance manifest is published.  Polling a filesystem
+    marker after NCCL teardown keeps every agent alive without retaining an
+    NCCL collective that could hit the watchdog timeout.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if marker.is_file():
+            payload = json.loads(marker.read_text(encoding="utf-8"))
+            if payload.get("status") == "success":
+                return
+            raise RuntimeError(
+                f"Rank 0 cache finalization failed: {payload.get('error', 'unknown error')}"
+            )
+        time.sleep(1.0)
+    raise TimeoutError(f"Timed out waiting for rank 0 cache finalization marker: {marker}")
+
+
+def write_finalize_marker(marker: Path, *, status: str, error: str | None = None) -> None:
+    payload = {"status": status}
+    if error is not None:
+        payload["error"] = error
+    temporary = marker.with_suffix(".tmp")
+    temporary.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, marker)
 
 
 def _sha256(path: Path) -> str:
@@ -142,6 +182,12 @@ def main() -> int:
         torch.distributed.init_process_group(backend="nccl")
         initialized_here = True
 
+    marker = finalize_marker(root, args.split)
+    if world_size > 1:
+        if rank == 0:
+            marker.unlink(missing_ok=True)
+        torch.distributed.barrier()
+
     for index in range(rank, len(dataset), world_size):
         target = entry_path(root, index)
         if target.is_file():
@@ -155,7 +201,14 @@ def main() -> int:
     write_manifest = finish_distributed_prewarm(
         rank=rank, world_size=world_size, initialized_here=initialized_here
     )
-    if write_manifest:
+    if not write_manifest:
+        wait_for_finalize_marker(
+            marker,
+            float(os.environ.get("TAO_CACHE_FINALIZE_TIMEOUT_SECONDS", "7200")),
+        )
+        return 0
+
+    try:
         missing = [index for index in range(len(dataset)) if not entry_path(root, index).is_file()]
         if missing:
             raise RuntimeError(f"Cache prewarm incomplete: {len(missing)} missing entries; first={missing[:10]}")
@@ -177,6 +230,10 @@ def main() -> int:
         temporary = root / "cache_provenance.json.tmp"
         temporary.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         os.replace(temporary, root / "cache_provenance.json")
+        write_finalize_marker(marker, status="success")
+    except Exception as exc:
+        write_finalize_marker(marker, status="failure", error=f"{type(exc).__name__}: {exc}")
+        raise
     return 0
 
 
