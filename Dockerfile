@@ -248,4 +248,6 @@ RUN pip install /workspace/cosmos_rl${COSMOS_RL_EXTRAS:+[$COSMOS_RL_EXTRAS]} && 
         bash /workspace/cosmos_rl/tools/scripts/setup_vla.sh; \
     fi && \
     rm -rf /workspace/cosmos_rl
+RUN python -m cosmos_rl.utils.runtime_dependency_contract \
+        --repair-vllm-conv3d --verify-deepep
 RUN pip uninstall -y xformers
