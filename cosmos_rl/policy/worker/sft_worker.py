@@ -58,6 +58,24 @@ def _is_pp_enabled(parallel_dims) -> bool:
     return bool(getattr(parallel_dims, "pp_enabled", False))
 
 
+def _dataloader_worker_kwargs(
+    num_workers: int, prefetch_factor: Optional[int]
+) -> Dict[str, Any]:
+    """Build CUDA-safe DataLoader worker options.
+
+    Forking after the policy process initializes CUDA/NCCL leaves the child
+    unable to create the FFmpeg NVDEC context. Spawn gives video workers a
+    clean CUDA runtime. PyTorch also rejects prefetch_factor when workers are
+    disabled, so only forward it for a positive worker count.
+    """
+    kwargs: Dict[str, Any] = {"num_workers": num_workers}
+    if num_workers > 0:
+        kwargs["multiprocessing_context"] = "spawn"
+        if prefetch_factor is not None:
+            kwargs["prefetch_factor"] = prefetch_factor
+    return kwargs
+
+
 class SFTDataset(Dataset):
     def __init__(
         self,
@@ -665,9 +683,11 @@ class SFTPolicyWorker(PolicyWorkerBase):
                 data_loader = DataLoader(
                     train_dataset,
                     batch_size=None,  # Batches are already formed by IterableDataset
-                    num_workers=self.config.train.train_policy.dataloader_num_workers,
-                    prefetch_factor=self.config.train.train_policy.dataloader_prefetch_factor,
                     collate_fn=collate_fn,  # Still need collate_fn for final batch formatting
+                    **_dataloader_worker_kwargs(
+                        self.config.train.train_policy.dataloader_num_workers,
+                        self.config.train.train_policy.dataloader_prefetch_factor,
+                    ),
                 )
             elif sampler_in_batch is not None:
                 logger.info(
@@ -675,10 +695,12 @@ class SFTPolicyWorker(PolicyWorkerBase):
                 )
                 data_loader = DataLoader(
                     train_dataset,
-                    num_workers=self.config.train.train_policy.dataloader_num_workers,
-                    prefetch_factor=self.config.train.train_policy.dataloader_prefetch_factor,
                     batch_sampler=sampler_in_batch,
                     collate_fn=collate_fn,
+                    **_dataloader_worker_kwargs(
+                        self.config.train.train_policy.dataloader_num_workers,
+                        self.config.train.train_policy.dataloader_prefetch_factor,
+                    ),
                 )
             else:
                 # drop_last=True when PP is enabled to avoid incomplete microbatches at epoch end
@@ -686,12 +708,14 @@ class SFTPolicyWorker(PolicyWorkerBase):
                     train_dataset,
                     batch_size=self.config.train.train_batch_per_replica,
                     shuffle=False,
-                    num_workers=self.config.train.train_policy.dataloader_num_workers,
-                    prefetch_factor=self.config.train.train_policy.dataloader_prefetch_factor,
                     sampler=sampler,
                     collate_fn=collate_fn,
                     drop_last=self.config.train.train_policy.dataloader_drop_last
                     or _is_pp_enabled(self.parallel_dims),
+                    **_dataloader_worker_kwargs(
+                        self.config.train.train_policy.dataloader_num_workers,
+                        self.config.train.train_policy.dataloader_prefetch_factor,
+                    ),
                 )
             return data_loader
 
@@ -835,21 +859,25 @@ class SFTPolicyWorker(PolicyWorkerBase):
                 val_batch_sampler = val_batch_sampler(**filtered)
             self.val_data_loader = DataLoader(
                 val_dataset,
-                num_workers=val_num_workers,
-                prefetch_factor=val_prefetch_factor,
                 batch_sampler=val_batch_sampler,
                 collate_fn=collate_fn,
+                **_dataloader_worker_kwargs(
+                    val_num_workers,
+                    val_prefetch_factor,
+                ),
             )
         else:
             self.val_data_loader = DataLoader(
                 val_dataset,
                 batch_size=self.config.validation.batch_size
                 or self.config.train.train_batch_per_replica,
-                num_workers=val_num_workers,
-                prefetch_factor=val_prefetch_factor,
                 sampler=val_sampler,
                 collate_fn=collate_fn,
                 drop_last=self.config.train.train_policy.dataloader_drop_last,
+                **_dataloader_worker_kwargs(
+                    val_num_workers,
+                    val_prefetch_factor,
+                ),
             )
 
         steps_by_dataset = (

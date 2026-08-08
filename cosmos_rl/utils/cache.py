@@ -31,9 +31,22 @@ class DiskCache:
 
         self.max_concurrent_tasks = 4
         self.max_files_per_dir = 10000
-        self.executor = ThreadPoolExecutor(
-            max_workers=4, thread_name_prefix="disk_cache"
-        )
+        self.executor = self._new_executor()
+
+    @staticmethod
+    def _new_executor() -> ThreadPoolExecutor:
+        return ThreadPoolExecutor(max_workers=4, thread_name_prefix="disk_cache")
+
+    def __getstate__(self):
+        """Exclude live worker threads when a DataLoader uses spawn."""
+        state = self.__dict__.copy()
+        state.pop("executor", None)
+        return state
+
+    def __setstate__(self, state):
+        """Recreate the asynchronous writer in the spawned worker."""
+        self.__dict__.update(state)
+        self.executor = self._new_executor()
 
     def path_for(self, idx: int) -> str:
         # avoid too many files in a single directory, limit by filesystem
