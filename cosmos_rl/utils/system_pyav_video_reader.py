@@ -28,6 +28,9 @@ _CACHE: OrderedDict[tuple[Any, ...], tuple[torch.Tensor, dict[str, Any], float]]
     OrderedDict()
 )
 _INFLIGHT: dict[tuple[Any, ...], threading.Event] = {}
+_PROCESSED_CACHE: OrderedDict[tuple[Any, ...], Any] = OrderedDict()
+_PROCESSED_INFLIGHT: dict[tuple[Any, ...], threading.Event] = {}
+_ORIGINAL_FETCH_VIDEO: Any = None
 _LOCK = threading.RLock()
 # The release FFmpeg maps H.264/H.265 to CUDA decoders. Independent decoder
 # contexts created concurrently in one Python process can block each other in
@@ -47,6 +50,29 @@ def _cache_key(element: dict[str, Any]) -> tuple[Any, ...]:
             "min_frames",
             "max_frames",
         )
+    )
+
+
+def _processed_cache_key(
+    element: dict[str, Any],
+    image_patch_size: int,
+    return_video_sample_fps: bool,
+    return_video_metadata: bool,
+) -> tuple[Any, ...]:
+    """Include every fetch_video input that can change the resized result."""
+    return _cache_key(element) + tuple(
+        element.get(key)
+        for key in (
+            "min_pixels",
+            "max_pixels",
+            "total_pixels",
+            "resized_height",
+            "resized_width",
+        )
+    ) + (
+        image_patch_size,
+        return_video_sample_fps,
+        return_video_metadata,
     )
 
 
@@ -170,18 +196,83 @@ def read_video_system_pyav(
                 completed.set()
 
 
+def fetch_video_system_pyav_cached(
+    element: dict[str, Any],
+    image_patch_size: int = 14,
+    return_video_sample_fps: bool = False,
+    return_video_metadata: bool = False,
+) -> Any:
+    """Cache qwen-vl-utils' fully resized video result with single-flight reads.
+
+    WTS contains many questions for each clip. Caching only the decoded uint8
+    frames still makes every question repeat the expensive bicubic resize and
+    float conversion. This wrapper moves the cache boundary past that work.
+    """
+    if _ORIGINAL_FETCH_VIDEO is None:
+        raise RuntimeError("system PyAV video reader has not been registered")
+
+    key = _processed_cache_key(
+        element,
+        image_patch_size,
+        return_video_sample_fps,
+        return_video_metadata,
+    )
+    while True:
+        with _LOCK:
+            cached = _PROCESSED_CACHE.get(key)
+            if cached is not None:
+                _PROCESSED_CACHE.move_to_end(key)
+                return cached
+            event = _PROCESSED_INFLIGHT.get(key)
+            if event is None:
+                event = threading.Event()
+                _PROCESSED_INFLIGHT[key] = event
+                owner = True
+            else:
+                owner = False
+        if owner:
+            break
+        event.wait()
+
+    try:
+        result = _ORIGINAL_FETCH_VIDEO(
+            element,
+            image_patch_size=image_patch_size,
+            return_video_sample_fps=return_video_sample_fps,
+            return_video_metadata=return_video_metadata,
+        )
+        with _LOCK:
+            if _CACHE_MAX_ITEMS:
+                _PROCESSED_CACHE[key] = result
+                _PROCESSED_CACHE.move_to_end(key)
+                while len(_PROCESSED_CACHE) > _CACHE_MAX_ITEMS:
+                    _PROCESSED_CACHE.popitem(last=False)
+        return result
+    finally:
+        with _LOCK:
+            completed = _PROCESSED_INFLIGHT.pop(key, None)
+            if completed is not None:
+                completed.set()
+
+
 def register_system_pyav_video_reader() -> None:
     """Replace qwen-vl-utils' full-file torchvision decoder in this process."""
+    global _ORIGINAL_FETCH_VIDEO
+
     import qwen_vl_utils.vision_process as vision_process
 
     if os.environ.get("FORCE_QWENVL_VIDEO_READER") not in (None, "torchvision"):
         raise RuntimeError(
             "release Cosmos-RL requires FORCE_QWENVL_VIDEO_READER=torchvision"
-        )
+    )
     vision_process.VIDEO_READER_BACKENDS["torchvision"] = read_video_system_pyav
+    if vision_process.fetch_video is not fetch_video_system_pyav_cached:
+        _ORIGINAL_FETCH_VIDEO = vision_process.fetch_video
+        vision_process.fetch_video = fetch_video_system_pyav_cached
 
 
 def clear_video_cache() -> None:
     """Clear cached clips; intended for tests and explicit memory recovery."""
     with _LOCK:
         _CACHE.clear()
+        _PROCESSED_CACHE.clear()

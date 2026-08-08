@@ -17,6 +17,7 @@ def test_registration_replaces_qwen_torchvision_backend(monkeypatch):
         vision_process.VIDEO_READER_BACKENDS["torchvision"]
         is reader.read_video_system_pyav
     )
+    assert vision_process.fetch_video is reader.fetch_video_system_pyav_cached
 
 
 def test_repeated_parallel_reads_are_single_flight(monkeypatch):
@@ -45,6 +46,48 @@ def test_repeated_parallel_reads_are_single_flight(monkeypatch):
 def test_cache_key_separates_sampling_configuration():
     assert reader._cache_key({"video": "a.mp4", "nframes": 8}) != reader._cache_key(
         {"video": "a.mp4", "nframes": 16}
+    )
+
+
+def test_repeated_parallel_fetches_cache_processed_video(monkeypatch):
+    reader.clear_video_cache()
+    monkeypatch.setattr(reader, "_CACHE_MAX_ITEMS", 8)
+    calls = 0
+    calls_lock = threading.Lock()
+    processed = torch.zeros(8, 3, 2, 2, dtype=torch.float32)
+
+    def fake_fetch(
+        element,
+        image_patch_size=14,
+        return_video_sample_fps=False,
+        return_video_metadata=False,
+    ):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+        threading.Event().wait(0.02)
+        return (processed, {"fps": 1.0})
+
+    monkeypatch.setattr(reader, "_ORIGINAL_FETCH_VIDEO", fake_fetch)
+    element = {"video": "/tmp/repeated.mp4", "nframes": 8, "max_pixels": 64}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(
+            pool.map(
+                lambda _: reader.fetch_video_system_pyav_cached(
+                    element, image_patch_size=16, return_video_metadata=True
+                ),
+                range(16),
+            )
+        )
+
+    assert calls == 1
+    assert all(result is results[0] for result in results)
+
+
+def test_processed_cache_key_separates_resize_configuration():
+    common = ({"video": "a.mp4", "nframes": 8}, 16, False, True)
+    assert reader._processed_cache_key(*common) != reader._processed_cache_key(
+        {"video": "a.mp4", "nframes": 8, "max_pixels": 64}, 16, False, True
     )
 
 
