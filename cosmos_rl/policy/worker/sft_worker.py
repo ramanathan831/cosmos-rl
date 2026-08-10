@@ -127,7 +127,9 @@ class SFTDataset(Dataset):
                 fingerprint = getattr(self.config, "dataset_cache_fingerprint", None)
             if explicit_root:
                 if not fingerprint:
-                    raise ValueError("dataset_cache_fingerprint is required with dataset_cache_dir")
+                    raise ValueError(
+                        "dataset_cache_fingerprint is required with dataset_cache_dir"
+                    )
                 cache_folder = os.path.join(
                     os.path.realpath(os.path.expanduser(explicit_root)),
                     f"{cache_prefix}-{fingerprint}",
@@ -146,7 +148,9 @@ class SFTDataset(Dataset):
             if getattr(self.config, "require_complete_dataset_cache", False):
                 manifest_path = os.path.join(cache_folder, "cache_provenance.json")
                 if not os.path.isfile(manifest_path):
-                    raise RuntimeError(f"Required cache provenance is missing: {manifest_path}")
+                    raise RuntimeError(
+                        f"Required cache provenance is missing: {manifest_path}"
+                    )
                 with open(manifest_path, encoding="utf-8") as manifest_file:
                     manifest = json.load(manifest_file)
                 expected = {
@@ -161,8 +165,14 @@ class SFTDataset(Dataset):
                     if manifest.get(key) != value
                 }
                 if mismatches:
-                    raise RuntimeError(f"Dataset cache provenance mismatch: {mismatches}")
-                missing = [idx for idx in range(len(self.dataset)) if not os.path.isfile(self.cache.path_for(idx))]
+                    raise RuntimeError(
+                        f"Dataset cache provenance mismatch: {mismatches}"
+                    )
+                missing = [
+                    idx
+                    for idx in range(len(self.dataset))
+                    if not os.path.isfile(self.cache.path_for(idx))
+                ]
                 if missing:
                     raise RuntimeError(
                         f"Dataset cache is incomplete: {len(missing)} missing entries; first={missing[:10]}"
@@ -997,7 +1007,9 @@ class SFTPolicyWorker(PolicyWorkerBase):
             val_loss_denominator += val_stats["loss_denominator"]
 
         if val_loss_denominator <= 0:
-            raise RuntimeError("Validation produced zero valid labels; refusing to report a loss")
+            raise RuntimeError(
+                "Validation produced zero valid labels; refusing to report a loss"
+            )
         val_avg_loss = val_loss_numerator / val_loss_denominator
 
         # Call post_validation_hook
@@ -1174,7 +1186,9 @@ class SFTPolicyWorker(PolicyWorkerBase):
                 "total_steps": self.total_steps,
                 "start_epoch": self.start_epoch,
                 "start_step": self.train_step,
-                "parameter_summary": getattr(getattr(self.trainer, "model", None), "parameter_summary", None),
+                "parameter_summary": getattr(
+                    getattr(self.trainer, "model", None), "parameter_summary", None
+                ),
             }
             self.pre_training_hook(self, report_data=pre_training_data)
 
@@ -1297,7 +1311,9 @@ class SFTPolicyWorker(PolicyWorkerBase):
                     val_score=val_avg_loss,
                     steps_per_epoch=len(self.train_data_loader),
                 )
-                if checkpoint_event and util.is_master_rank(self.parallel_dims, self.global_rank):
+                if checkpoint_event and util.is_master_rank(
+                    self.parallel_dims, self.global_rank
+                ):
                     for custom_logger_fn in self.custom_logger_fns:
                         custom_logger_fn(checkpoint_event, self.train_step)
 
@@ -1349,7 +1365,9 @@ class SFTPolicyWorker(PolicyWorkerBase):
                 val_score=val_avg_loss,
                 steps_per_epoch=len(self.train_data_loader),
             )
-            if checkpoint_event and util.is_master_rank(self.parallel_dims, self.global_rank):
+            if checkpoint_event and util.is_master_rank(
+                self.parallel_dims, self.global_rank
+            ):
                 for custom_logger_fn in self.custom_logger_fns:
                     custom_logger_fn(checkpoint_event, self.train_step)
         else:
@@ -1360,7 +1378,9 @@ class SFTPolicyWorker(PolicyWorkerBase):
         # Call post_training_hook after training completes
         if self.post_training_hook is not None:
             if train_loss_denominator <= 0:
-                raise RuntimeError("Training produced zero valid labels; refusing to report a loss")
+                raise RuntimeError(
+                    "Training produced zero valid labels; refusing to report a loss"
+                )
             post_training_data = {
                 "final_epoch": cur_epoch,
                 "final_step": self.train_step,
@@ -1373,7 +1393,9 @@ class SFTPolicyWorker(PolicyWorkerBase):
             self.post_training_hook(self, report_data=post_training_data)
 
         if train_loss_denominator <= 0:
-            raise RuntimeError("Training produced zero valid labels; refusing to report a loss")
+            raise RuntimeError(
+                "Training produced zero valid labels; refusing to report a loss"
+            )
         complete_metrics = {
             "train/avg_loss": train_loss_numerator / train_loss_denominator,
             "train/loss_numerator": train_loss_numerator,

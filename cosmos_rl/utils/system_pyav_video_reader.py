@@ -60,19 +60,23 @@ def _processed_cache_key(
     return_video_metadata: bool,
 ) -> tuple[Any, ...]:
     """Include every fetch_video input that can change the resized result."""
-    return _cache_key(element) + tuple(
-        element.get(key)
-        for key in (
-            "min_pixels",
-            "max_pixels",
-            "total_pixels",
-            "resized_height",
-            "resized_width",
+    return (
+        _cache_key(element)
+        + tuple(
+            element.get(key)
+            for key in (
+                "min_pixels",
+                "max_pixels",
+                "total_pixels",
+                "resized_height",
+                "resized_width",
+            )
         )
-    ) + (
-        image_patch_size,
-        return_video_sample_fps,
-        return_video_metadata,
+        + (
+            image_patch_size,
+            return_video_sample_fps,
+            return_video_metadata,
+        )
     )
 
 
@@ -264,7 +268,7 @@ def register_system_pyav_video_reader() -> None:
     if os.environ.get("FORCE_QWENVL_VIDEO_READER") not in (None, "torchvision"):
         raise RuntimeError(
             "release Cosmos-RL requires FORCE_QWENVL_VIDEO_READER=torchvision"
-    )
+        )
     vision_process.VIDEO_READER_BACKENDS["torchvision"] = read_video_system_pyav
     if vision_process.fetch_video is not fetch_video_system_pyav_cached:
         _ORIGINAL_FETCH_VIDEO = vision_process.fetch_video

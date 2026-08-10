@@ -112,6 +112,34 @@ class CustomConfig(pydantic.BaseModel):
     """Vision processor config."""
 
 
+def configure_video_decoder(custom_config: CustomConfig) -> dict[str, object]:
+    """Activate the decoder explicitly selected by the TAO WTS contract."""
+    if (
+        custom_config.video_decoder == "pynvvideocodec"
+        and os.environ.get("COSMOS_ROLE") != "Controller"
+    ):
+        from cosmos_rl.utils.pynv_video_reader import register_pynv_video_reader
+
+        return register_pynv_video_reader(
+            cache_size=custom_config.video_cache_size,
+            video_override_map=custom_config.video_override_map,
+        )
+    if custom_config.video_decoder == "torchvision":
+        if os.environ.get("FORCE_QWENVL_VIDEO_READER") != "torchvision":
+            raise RuntimeError(
+                "custom.video_decoder=torchvision requires "
+                "FORCE_QWENVL_VIDEO_READER=torchvision"
+            )
+        register_system_pyav_video_reader()
+        return {"backend": "torchvision", "implementation": "system_pyav_sparse"}
+    if (
+        custom_config.video_decoder == "cpu"
+        or os.environ.get("COSMOS_ROLE") == "Controller"
+    ):
+        return {"backend": custom_config.video_decoder}
+    raise ValueError("custom.video_decoder must be pynvvideocodec, torchvision, or cpu")
+
+
 class CustomDataset(torch.utils.data.Dataset):
     def __init__(
         self,
@@ -314,16 +342,8 @@ def main():
         config_kwargs = toml.load(f)
     config = cosmos_rl.policy.config.Config.from_dict(config_kwargs)
     custom_config = CustomConfig.model_validate(config_kwargs.get("custom", {}))
-    if custom_config.video_decoder == "pynvvideocodec" and os.environ.get("COSMOS_ROLE") != "Controller":
-        from cosmos_rl.utils.pynv_video_reader import register_pynv_video_reader
-
-        decoder_info = register_pynv_video_reader(
-            cache_size=custom_config.video_cache_size,
-            video_override_map=custom_config.video_override_map,
-        )
-        logger.info("GPU video decoder registered: %s", decoder_info)
-    elif custom_config.video_decoder not in {"pynvvideocodec", "cpu"}:
-        raise ValueError("custom.video_decoder must be pynvvideocodec or cpu")
+    decoder_info = configure_video_decoder(custom_config)
+    logger.info("Video decoder configured: %s", decoder_info)
 
     # Save config if controller
     role = os.environ.get("COSMOS_ROLE")
