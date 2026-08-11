@@ -99,6 +99,47 @@ def _configure_conversation_video_decoder(custom) -> dict[str, object]:
     return configure_video_decoder(custom)
 
 
+def _prewarm_indices(dataset, kind: str, rank: int, world_size: int) -> tuple[list[int], str]:
+    """Assign repeated-media records together without changing cache indices.
+
+    Conversation manifests commonly reuse each video for many questions.  A
+    rank-strided prewarm defeats the sparse reader's small in-process media
+    cache and decodes the same video once per record.  Grouping only the
+    *processing order* keeps every cache entry at its original dataset index,
+    while ensuring one rank processes a video's records consecutively.
+    """
+    if world_size < 1 or not 0 <= rank < world_size:
+        raise ValueError(f"invalid distributed coordinates: rank={rank}, world_size={world_size}")
+    annotation = getattr(dataset, "annotation", None)
+    if kind != "wts" or not isinstance(annotation, list) or len(annotation) != len(dataset):
+        return list(range(rank, len(dataset), world_size)), "rank_strided"
+
+    groups: dict[str, list[int]] = {}
+    for index, record in enumerate(annotation):
+        media = None
+        if isinstance(record, dict):
+            media = {
+                key: record.get(key)
+                for key in ("video", "videos", "image", "images")
+                if record.get(key) is not None
+            }
+        if not media:
+            key = f"record:{index}"
+        else:
+            key = "media:" + json.dumps(
+                media, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
+        groups.setdefault(key, []).append(index)
+
+    assignments: list[list[int]] = [[] for _ in range(world_size)]
+    loads = [0] * world_size
+    for group in groups.values():
+        target_rank = min(range(world_size), key=lambda candidate: (loads[candidate], candidate))
+        assignments[target_rank].extend(group)
+        loads[target_rank] += len(group)
+    return assignments[rank], "media_grouped_balanced"
+
+
 def _build_dataset_and_packer(kind, split, config, raw):
     custom_raw = raw.get("custom", {})
     if kind == "wts":
@@ -189,7 +230,8 @@ def main() -> int:
             marker.unlink(missing_ok=True)
         torch.distributed.barrier()
 
-    for index in range(rank, len(dataset), world_size):
+    indices, prewarm_strategy = _prewarm_indices(dataset, args.dataset_kind, rank, world_size)
+    for index in indices:
         target = entry_path(root, index)
         if target.is_file():
             continue
@@ -225,6 +267,10 @@ def main() -> int:
             "cache_fingerprint": args.cache_fingerprint,
             "config": str(config_path),
             "config_sha256": _sha256(config_path),
+            "prewarm_schedule": {
+                "strategy": prewarm_strategy,
+                "world_size": world_size,
+            },
             "entry_hashes": entry_hashes,
             "complete": True,
         }

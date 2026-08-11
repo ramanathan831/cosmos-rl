@@ -8,6 +8,7 @@ import pytest
 
 from cosmos_rl.tools.prewarm_sft_cache import (
     _configure_conversation_video_decoder,
+    _prewarm_indices,
     cache_path,
     combined_cache_fingerprint,
     entry_path,
@@ -32,6 +33,47 @@ def test_conversation_prewarm_uses_training_video_decoder_contract(monkeypatch) 
 
     assert result == {"backend": "torchvision"}
     assert calls == ["torchvision"]
+
+
+class _ConversationDataset:
+    def __init__(self, annotation) -> None:
+        self.annotation = annotation
+
+    def __len__(self) -> int:
+        return len(self.annotation)
+
+
+def test_conversation_prewarm_keeps_repeated_media_on_one_rank() -> None:
+    dataset = _ConversationDataset(
+        [
+            {"video": "a.mp4"},
+            {"video": "b.mp4"},
+            {"video": "a.mp4"},
+            {"video": "b.mp4"},
+            {"video": "a.mp4"},
+            {"video": "c.mp4"},
+            {"video": "a.mp4"},
+        ]
+    )
+
+    rank_zero, strategy_zero = _prewarm_indices(dataset, "wts", 0, 2)
+    rank_one, strategy_one = _prewarm_indices(dataset, "wts", 1, 2)
+
+    assert strategy_zero == strategy_one == "media_grouped_balanced"
+    assert sorted(rank_zero + rank_one) == list(range(len(dataset)))
+    for media in ("a.mp4", "b.mp4", "c.mp4"):
+        indices = {
+            index
+            for index, record in enumerate(dataset.annotation)
+            if record["video"] == media
+        }
+        assert indices <= set(rank_zero) or indices <= set(rank_one)
+
+
+def test_non_conversation_prewarm_retains_rank_striding() -> None:
+    dataset = _ConversationDataset([{"video": f"{index}.mp4"} for index in range(7)])
+
+    assert _prewarm_indices(dataset, "aetc", 1, 3) == ([1, 4], "rank_strided")
 
 
 def test_cache_key_is_deterministic_and_runtime_root_is_preserved(tmp_path) -> None:
