@@ -2,11 +2,25 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import threading
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from cosmos_rl.utils import system_pyav_video_reader as reader
+
+
+def test_missing_video_decoder_fails_before_native_decode(monkeypatch, tmp_path):
+    video_path = tmp_path / "unsupported.mp4"
+    video_path.touch()
+    container = SimpleNamespace(
+        streams=SimpleNamespace(video=[SimpleNamespace(codec_context=None)]),
+        close=lambda: None,
+    )
+    monkeypatch.setattr(reader.av, "open", lambda _path: container)
+
+    with pytest.raises(RuntimeError, match="no decoder for the primary video stream"):
+        reader._decode_sparse({"video": str(video_path), "nframes": 8})
 
 
 def test_registration_replaces_qwen_torchvision_backend(monkeypatch):

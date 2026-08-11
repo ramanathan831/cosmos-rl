@@ -108,6 +108,11 @@ def _decode_sparse(
     container = av.open(video_path)
     try:
         stream = container.streams.video[0]
+        if stream.codec_context is None:
+            raise RuntimeError(
+                "system FFmpeg has no decoder for the primary video stream: "
+                f"{video_path}"
+            )
         if stream.average_rate is None:
             raise RuntimeError(f"video has no average frame rate: {video_path}")
         fps = float(stream.average_rate)
