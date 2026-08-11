@@ -48,7 +48,7 @@ class DiskCache:
         self.__dict__.update(state)
         self.executor = self._new_executor()
 
-    def __cache_ojb_path(self, idx: int) -> str:
+    def path_for(self, idx: int) -> str:
         # avoid too many files in a single directory, limit by filesystem
         # TODO(zjx): we can reduce files count by merge data
         subdir = str(idx // self.max_files_per_dir)
@@ -76,11 +76,11 @@ class DiskCache:
             return
 
         # Create a task to run the async operation
-        cachePath = self.__cache_ojb_path(idx)
+        cachePath = self.path_for(idx)
         self.__save_to_disk(cachePath, obj)
 
     def get(self, idx: int) -> Optional[Any]:
-        cachePath = self.__cache_ojb_path(idx)
+        cachePath = self.path_for(idx)
         if os.path.exists(cachePath):
             try:
                 return torch.load(cachePath)
@@ -94,3 +94,7 @@ class DiskCache:
 
         if os.path.exists(self.cache_path):
             shutil.rmtree(self.cache_path)
+
+    def flush(self) -> None:
+        """Wait for every pending atomic write without deleting the cache."""
+        self.executor.shutdown(wait=True)

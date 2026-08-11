@@ -26,7 +26,8 @@ Usage:
 
 Environment Variables for TAO logging:
     TAO_API_JOB_ID: Job ID for status file path
-    TAO_API_RESULTS_DIR: Results directory (defaults to /results)
+    TAO_API_RESULTS_DIR: User-supplied results directory
+    TAO_STATUS_FILE: Explicit status file path (preferred for direct launches)
 
 The status file is written to: {TAO_API_RESULTS_DIR}/{TAO_API_JOB_ID}/status.json
 """
@@ -50,6 +51,7 @@ register_system_pyav_video_reader()
 
 # Import TAO status logger utilities
 from cosmos_rl.tools.custom_hooks import TAOStatusLogger
+from cosmos_rl.tools.custom_hooks.lifecycle_status import append_terminal_status
 
 # Import TAO core logging for STARTED/SUCCESS/FAILURE status
 try:
@@ -97,6 +99,10 @@ class CustomConfig(pydantic.BaseModel):
     system_prompt: str = pydantic.Field(default="")
     """System prompt."""
 
+    video_decoder: pydantic.StrictStr = "pynvvideocodec"
+    video_cache_size: int = pydantic.Field(default=2, ge=0)
+    video_override_map: str | None = None
+
     vision: VisionConfig = pydantic.Field(
         default=VisionConfig(
             fps=1,
@@ -104,6 +110,34 @@ class CustomConfig(pydantic.BaseModel):
         )
     )
     """Vision processor config."""
+
+
+def configure_video_decoder(custom_config: CustomConfig) -> dict[str, object]:
+    """Activate the decoder explicitly selected by the TAO WTS contract."""
+    if (
+        custom_config.video_decoder == "pynvvideocodec"
+        and os.environ.get("COSMOS_ROLE") != "Controller"
+    ):
+        from cosmos_rl.utils.pynv_video_reader import register_pynv_video_reader
+
+        return register_pynv_video_reader(
+            cache_size=custom_config.video_cache_size,
+            video_override_map=custom_config.video_override_map,
+        )
+    if custom_config.video_decoder == "torchvision":
+        if os.environ.get("FORCE_QWENVL_VIDEO_READER") != "torchvision":
+            raise RuntimeError(
+                "custom.video_decoder=torchvision requires "
+                "FORCE_QWENVL_VIDEO_READER=torchvision"
+            )
+        register_system_pyav_video_reader()
+        return {"backend": "torchvision", "implementation": "system_pyav_sparse"}
+    if (
+        custom_config.video_decoder == "cpu"
+        or os.environ.get("COSMOS_ROLE") == "Controller"
+    ):
+        return {"backend": custom_config.video_decoder}
+    raise ValueError("custom.video_decoder must be pynvvideocodec, torchvision, or cpu")
 
 
 class CustomDataset(torch.utils.data.Dataset):
@@ -190,13 +224,13 @@ class CustomDataset(torch.utils.data.Dataset):
         return conversations
 
 
-def _get_results_dir() -> str:
+def _get_results_dir() -> str | None:
     """Get the results directory based on TAO environment variables."""
     job_id = os.environ.get("TAO_API_JOB_ID")
-    if job_id:
-        results_base = os.environ.get("TAO_API_RESULTS_DIR", "/results")
+    results_base = os.environ.get("TAO_API_RESULTS_DIR")
+    if job_id and results_base:
         return os.path.join(results_base, job_id)
-    return "./results"
+    return None
 
 
 def _is_master_rank() -> bool:
@@ -225,10 +259,12 @@ def monitor_status(experiment_name: str = "Cosmos-RL finetuning"):
     def decorator(func):
         def wrapper(*args, **kwargs):
             s_logger = None
+            status_file = None
 
             # Only setup logger on master rank
-            if HAS_TAO_CORE and _is_master_rank():
+            if HAS_TAO_CORE and _is_master_rank() and _get_results_dir() is not None:
                 results_dir = _get_results_dir()
+                assert results_dir is not None
                 os.makedirs(results_dir, exist_ok=True)
                 status_file = os.path.join(results_dir, "status.json")
 
@@ -252,22 +288,23 @@ def monitor_status(experiment_name: str = "Cosmos-RL finetuning"):
                 result = func(*args, **kwargs)
 
                 # Log SUCCESS
-                if s_logger:
-                    s_logger.write(
-                        status_level=Status.RUNNING,
-                        message=f"{experiment_name} training completed successfully",
+                if status_file:
+                    append_terminal_status(
+                        status_file,
+                        "SUCCESS",
+                        f"{experiment_name} training completed successfully",
                     )
                     logger.info(f"Job SUCCESS: {experiment_name}")
 
                 return result
 
             except (KeyboardInterrupt, SystemExit) as e:
-                if s_logger:
+                if status_file:
                     try:
-                        s_logger.write(
-                            status_level=Status.FAILURE,
-                            verbosity_level=Verbosity.WARNING,
-                            message=f"{experiment_name} training was interrupted: {str(e)}",
+                        append_terminal_status(
+                            status_file,
+                            "FAILURE",
+                            f"{experiment_name} training was interrupted: {str(e)}",
                         )
                     except Exception:
                         pass
@@ -275,12 +312,12 @@ def monitor_status(experiment_name: str = "Cosmos-RL finetuning"):
                 raise
 
             except Exception as e:
-                if s_logger:
+                if status_file:
                     try:
-                        s_logger.write(
-                            status_level=Status.FAILURE,
-                            verbosity_level=Verbosity.ERROR,
-                            message=f"{experiment_name} training failed: {str(e)}",
+                        append_terminal_status(
+                            status_file,
+                            "FAILURE",
+                            f"{experiment_name} training failed: {str(e)}",
                         )
                     except Exception:
                         pass
@@ -305,6 +342,8 @@ def main():
         config_kwargs = toml.load(f)
     config = cosmos_rl.policy.config.Config.from_dict(config_kwargs)
     custom_config = CustomConfig.model_validate(config_kwargs.get("custom", {}))
+    decoder_info = configure_video_decoder(custom_config)
+    logger.info("Video decoder configured: %s", decoder_info)
 
     # Save config if controller
     role = os.environ.get("COSMOS_ROLE")

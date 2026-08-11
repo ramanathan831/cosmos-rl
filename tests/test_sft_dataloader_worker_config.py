@@ -1,5 +1,7 @@
 import pickle
 
+from cosmos_rl.policy.config import SFTDataConfig
+from cosmos_rl.policy.worker.sft_worker import SFTDataset
 from cosmos_rl.policy.worker.sft_worker import _dataloader_worker_kwargs
 from cosmos_rl.utils.cache import DiskCache
 
@@ -25,3 +27,25 @@ def test_disk_cache_is_spawn_picklable(tmp_path):
 
     cache.executor.shutdown(wait=True)
     restored.executor.shutdown(wait=True)
+
+
+def test_disabled_dataset_cache_processes_samples_directly(monkeypatch):
+    def fail_if_cache_is_created(*_args, **_kwargs):
+        raise AssertionError("DiskCache must not be created in direct mode")
+
+    monkeypatch.setenv("COSMOS_CACHE", "/must-not-be-used")
+    monkeypatch.setattr(
+        "cosmos_rl.policy.worker.sft_worker.cache.DiskCache",
+        fail_if_cache_is_created,
+    )
+    config = SFTDataConfig(type="sft", enable_dataset_cache=False)
+
+    dataset = SFTDataset(
+        config,
+        dataset=[{"conversations": []}],
+        data_packer=object(),
+        is_user_dataset=True,
+        enable_cache=False,
+    )
+
+    assert dataset.cache is None

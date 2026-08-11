@@ -1,12 +1,12 @@
 redis = "12800"
-results_dir = "/results/e4291737-2b88-4dfe-82ef-6eaad77f3e88"
+results_dir = "__RESULTS_DIR__"
 
 [train]
 resume = false
 epoch = 2
 compile = false
 train_batch_per_replica = 4
-output_dir = "/results/e4291737-2b88-4dfe-82ef-6eaad77f3e88"
+output_dir = "__CHECKPOINT_DIR__"
 optm_lr = 0.0001
 optm_impl = "fused"
 optm_weight_decay = 0.01
@@ -36,7 +36,7 @@ dataloader_prefetch_factor = 1
 
 
 [policy]
-model_name_or_path = "/ptm/huggingface_models"
+model_name_or_path = "__BASE_MODEL_PATH_OR_URI__"
 model_max_length = 81920
 model_gradient_checkpointing = true
 
@@ -83,15 +83,15 @@ pp_size = 1
 cp_rotate_method = "allgather"
 
 [custom.train_dataset]
-annotation_path = "/data/wts_train/annotations.json"
-media_path = "/data/wts_train/videos"
+annotation_path = "__TRAIN_ANNOTATION_PATH__"
+media_path = "__TRAIN_MEDIA_ROOT__"
 
 [custom.vision]
 n_frames = 8
 
 [custom.val_dataset]
-annotation_path = "/data/wts_eval/annotations.json"
-media_path = "/data/wts_eval/videos"
+annotation_path = "__VALIDATION_ANNOTATION_PATH__"
+media_path = "__VALIDATION_MEDIA_ROOT__"
 
 [train.train_policy.dataset]
 name = "0108_cr2_sft_8"
