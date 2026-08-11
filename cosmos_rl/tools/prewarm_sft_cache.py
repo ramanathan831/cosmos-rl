@@ -92,6 +92,13 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _configure_conversation_video_decoder(custom) -> dict[str, object]:
+    """Use the same registered decoder contract as normal SFT training."""
+    from cosmos_rl.tools.custom_hooks.tao_sft_example import configure_video_decoder
+
+    return configure_video_decoder(custom)
+
+
 def _build_dataset_and_packer(kind, split, config, raw):
     custom_raw = raw.get("custom", {})
     if kind == "wts":
@@ -102,13 +109,7 @@ def _build_dataset_and_packer(kind, split, config, raw):
         dataset_config = custom.train_dataset if split == "train" else custom.val_dataset
         if dataset_config is None:
             raise ValueError(f"WTS {split} dataset was not supplied")
-        if custom.video_decoder == "pynvvideocodec":
-            from cosmos_rl.utils.pynv_video_reader import register_pynv_video_reader
-
-            register_pynv_video_reader(
-                cache_size=custom.video_cache_size,
-                video_override_map=custom.video_override_map,
-            )
+        _configure_conversation_video_decoder(custom)
         dataset = CustomDataset(
             config=config,
             custom_config=custom,

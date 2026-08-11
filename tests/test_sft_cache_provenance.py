@@ -2,10 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
 from cosmos_rl.tools.prewarm_sft_cache import (
+    _configure_conversation_video_decoder,
     cache_path,
     combined_cache_fingerprint,
     entry_path,
@@ -14,6 +16,22 @@ from cosmos_rl.tools.prewarm_sft_cache import (
     wait_for_finalize_marker,
     write_finalize_marker,
 )
+
+
+def test_conversation_prewarm_uses_training_video_decoder_contract(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(
+        "cosmos_rl.tools.custom_hooks.tao_sft_example.configure_video_decoder",
+        lambda custom: calls.append(custom.video_decoder)
+        or {"backend": custom.video_decoder},
+    )
+
+    result = _configure_conversation_video_decoder(
+        SimpleNamespace(video_decoder="torchvision")
+    )
+
+    assert result == {"backend": "torchvision"}
+    assert calls == ["torchvision"]
 
 
 def test_cache_key_is_deterministic_and_runtime_root_is_preserved(tmp_path) -> None:
