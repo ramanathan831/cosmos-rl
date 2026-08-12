@@ -56,6 +56,7 @@ def async_safe_ce(
     target_packing_mask: Optional[torch.Tensor] = None,
     dp_group: Optional[torch.distributed.ProcessGroup] = None,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    return_stats: bool = False,
     **kwargs,
 ) -> torch.Tensor:
     if output_packing_mask is not None:
@@ -85,6 +86,16 @@ def async_safe_ce(
         )
         # In case of all labels are ignored, loss will be nan.
         loss = torch.nan_to_num(loss, nan=0.0)
+        if return_stats:
+            raw = ce_impl(
+                output,
+                target,
+                ignore_index=ignore_index,
+                reduction="none",
+                lin_weight=lin_weight,
+            )
+            valid = target != ignore_index
+            return loss, raw[valid].sum().detach(), valid.sum().detach()
         return loss
     else:
         loss = ce_impl(
@@ -96,17 +107,22 @@ def async_safe_ce(
         )
 
         # Compute all token numbers across dp-world
-        n_valid_tokens = (target != ignore_index).sum()
+        valid_mask = target != ignore_index
+        local_numerator = loss[valid_mask].sum()
+        local_denominator = valid_mask.sum()
+        n_valid_tokens = local_denominator.detach().clone()
         num_dp_workers = 1
         if dp_group is not None:
             torch.distributed.all_reduce(n_valid_tokens, group=dp_group)
             num_dp_workers = torch.distributed.get_world_size(group=dp_group)
 
         loss = (
-            loss.sum()
+            local_numerator
             / (n_valid_tokens + 1e-8)
             * (num_dp_workers * loss_scaling_factor)
         )
+        if return_stats:
+            return loss, local_numerator.detach(), local_denominator.detach()
         return loss
 
 
@@ -171,6 +187,8 @@ class SFTTrainer(LLMTrainer):
             )
 
         aux_loss_dict = OrderedDict()
+        token_loss_numerator = torch.tensor(0.0, device=self.device, dtype=torch.float64)
+        token_loss_denominator = torch.tensor(0, device=self.device, dtype=torch.long)
 
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
@@ -388,11 +406,14 @@ class SFTTrainer(LLMTrainer):
                     # of lm_head to the loss function to fuse the linear and cross entropy.
                     kwargs["lin_weight"] = self.model.lm_head.weight
 
-                ce_loss = self.loss_fn(
+                ce_loss, mini_numerator, mini_denominator = self.loss_fn(
                     logits,
                     labels,
+                    return_stats=True,
                     **kwargs,
                 )
+                token_loss_numerator += mini_numerator.to(dtype=torch.float64)
+                token_loss_denominator += mini_denominator.to(dtype=torch.long)
                 aux_loss_dict["loss"] = (
                     ce_loss.detach()
                     if "loss" not in aux_loss_dict
@@ -475,6 +496,21 @@ class SFTTrainer(LLMTrainer):
             )
         global_avg_loss = global_avg_loss.cpu()
         global_max_loss = global_max_loss.cpu()
+
+        if self.parallel_dims.dp_replicate_enabled or self.parallel_dims.dp_shard_enabled:
+            torch.distributed.all_reduce(
+                token_loss_numerator,
+                op=torch.distributed.ReduceOp.SUM,
+                group=self.parallel_dims.mesh["dp"].get_group(),
+            )
+            torch.distributed.all_reduce(
+                token_loss_denominator,
+                op=torch.distributed.ReduceOp.SUM,
+                group=self.parallel_dims.mesh["dp"].get_group(),
+            )
+        report_data["train/loss_numerator"] = float(token_loss_numerator.item())
+        report_data["train/loss_denominator"] = int(token_loss_denominator.item())
+        report_data["train/valid_label_count"] = int(token_loss_denominator.item())
 
         if self.config.logging.logger:
             assert end_event.query()
@@ -632,28 +668,41 @@ class SFTTrainer(LLMTrainer):
                     ).logits
 
                 if pp_last_stage:
-                    val_loss = self.loss_fn(pp_out, val_labels)
+                    val_loss, val_numerator, val_denominator = self.loss_fn(
+                        pp_out, val_labels, return_stats=True
+                    )
                 else:
                     val_loss = torch.tensor([-1.0], device=self.device)
+                    val_numerator = torch.tensor(0.0, device=self.device, dtype=torch.float64)
+                    val_denominator = torch.tensor(0, device=self.device, dtype=torch.long)
             else:
                 val_output = self.forward_model(**val_batch)
                 val_logits = (
                     val_output.logits if hasattr(val_output, "logits") else val_output
                 )
 
-                val_loss = self.loss_fn(val_logits, val_labels)
+                val_loss, val_numerator, val_denominator = self.loss_fn(
+                    val_logits, val_labels, return_stats=True
+                )
 
-        if (
-            self.parallel_dims.dp_replicate_enabled
-            or self.parallel_dims.dp_shard_enabled
-        ):
-            val_loss = (  # noqa: F841
-                dist_util.dist_mean(val_loss, self.parallel_dims.mesh["dp"])
-            ) * self.parallel_dims.mesh["dp"].size()
-        else:
-            val_loss = val_loss.item()  # noqa: F841
-
-        return val_loss * val_inputs.size(0)
+        if self.parallel_dims.dp_replicate_enabled or self.parallel_dims.dp_shard_enabled:
+            torch.distributed.all_reduce(
+                val_numerator,
+                op=torch.distributed.ReduceOp.SUM,
+                group=self.parallel_dims.mesh["dp"].get_group(),
+            )
+            torch.distributed.all_reduce(
+                val_denominator,
+                op=torch.distributed.ReduceOp.SUM,
+                group=self.parallel_dims.mesh["dp"].get_group(),
+            )
+        denominator = int(val_denominator.item())
+        numerator = float(val_numerator.item())
+        return {
+            "loss_numerator": numerator,
+            "loss_denominator": denominator,
+            "avg_loss": numerator / max(denominator, 1),
+        }
 
     def checkpointing(
         self,
@@ -740,6 +789,19 @@ class SFTTrainer(LLMTrainer):
                     - self.parallel_dims.world_size / self.parallel_dims.pp,
                 )
             torch.distributed.barrier()
+            return {
+                "checkpoint/event": (
+                    "complete" if self.config.train.ckpt.save_mode == "sync" else "submitted"
+                ),
+                "checkpoint/identifier": ckpt_identifier,
+                "checkpoint/step": train_step,
+                "checkpoint/epoch": completed_epoch,
+                "checkpoint/output_dir": self.config.train.output_dir,
+                "checkpoint/path": os.path.join(
+                    self.config.train.output_dir, "checkpoints", ckpt_identifier, "policy"
+                ),
+            }
+        return None
 
     def load_model(self):
         """Load model weights from checkpoint if available."""

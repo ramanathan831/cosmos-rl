@@ -2,10 +2,25 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import threading
+from types import SimpleNamespace
 
+import pytest
 import torch
 
 from cosmos_rl.utils import system_pyav_video_reader as reader
+
+
+def test_missing_video_decoder_fails_before_native_decode(monkeypatch, tmp_path):
+    video_path = tmp_path / "unsupported.mp4"
+    video_path.touch()
+    container = SimpleNamespace(
+        streams=SimpleNamespace(video=[SimpleNamespace(codec_context=None)]),
+        close=lambda: None,
+    )
+    monkeypatch.setattr(reader.av, "open", lambda _path: container)
+
+    with pytest.raises(RuntimeError, match="no decoder for the primary video stream"):
+        reader._decode_sparse({"video": str(video_path), "nframes": 8})
 
 
 def test_registration_replaces_qwen_torchvision_backend(monkeypatch):
@@ -18,6 +33,42 @@ def test_registration_replaces_qwen_torchvision_backend(monkeypatch):
         is reader.read_video_system_pyav
     )
     assert vision_process.fetch_video is reader.fetch_video_system_pyav_cached
+
+
+def test_tao_wts_hook_accepts_explicit_torchvision_contract(monkeypatch):
+    from cosmos_rl.tools.custom_hooks.tao_sft_example import (
+        CustomConfig,
+        configure_video_decoder,
+    )
+
+    monkeypatch.setenv("FORCE_QWENVL_VIDEO_READER", "torchvision")
+    config = CustomConfig.model_validate(
+        {
+            "train_dataset": {"annotation_path": "/tmp/train.json"},
+            "video_decoder": "torchvision",
+        }
+    )
+    assert configure_video_decoder(config) == {
+        "backend": "torchvision",
+        "implementation": "system_pyav_sparse",
+    }
+
+
+def test_tao_wts_hook_rejects_implicit_torchvision_contract(monkeypatch):
+    from cosmos_rl.tools.custom_hooks.tao_sft_example import (
+        CustomConfig,
+        configure_video_decoder,
+    )
+
+    monkeypatch.delenv("FORCE_QWENVL_VIDEO_READER", raising=False)
+    config = CustomConfig.model_validate(
+        {
+            "train_dataset": {"annotation_path": "/tmp/train.json"},
+            "video_decoder": "torchvision",
+        }
+    )
+    with pytest.raises(RuntimeError, match="FORCE_QWENVL_VIDEO_READER=torchvision"):
+        configure_video_decoder(config)
 
 
 def test_repeated_parallel_reads_are_single_flight(monkeypatch):
