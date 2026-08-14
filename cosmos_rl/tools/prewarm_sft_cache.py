@@ -174,6 +174,7 @@ def _build_dataset_and_packer(kind, split, config, raw):
 
             register_pynv_video_reader(
                 cache_size=custom.video_cache_size,
+                decoder_cache_size=custom.video_decoder_cache_size,
                 video_override_map=custom.video_override_map,
             )
         dataset = CustomDataset(config=config, custom_config=custom, dataset_config=dataset_config)

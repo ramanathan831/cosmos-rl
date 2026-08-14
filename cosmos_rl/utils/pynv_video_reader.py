@@ -18,12 +18,15 @@ from typing import Any
 def register_pynv_video_reader(
     *,
     cache_size: int = 0,
+    decoder_cache_size: int = 4,
     video_override_map: str | None = None,
     strict: bool = True,
 ) -> dict[str, Any]:
     """Register a Qwen NVDEC reader and optionally forbid CPU fallback."""
     if cache_size < 0:
         raise ValueError("cache_size must be non-negative")
+    if decoder_cache_size < 1:
+        raise ValueError("decoder_cache_size must be positive")
     # DataLoader workers use the spawn start method, so parent-process monkey
     # patches are not inherited.  Export the complete registration contract so
     # the baked qwen-vl-utils worker hook can recreate this reader in every
@@ -31,6 +34,7 @@ def register_pynv_video_reader(
     os.environ["FORCE_QWENVL_VIDEO_READER"] = "pynvvideocodec"
     os.environ["TAO_PYNV_VIDEO_STRICT"] = "1" if strict else "0"
     os.environ["TAO_PYNV_VIDEO_CACHE_SIZE"] = str(cache_size)
+    os.environ["TAO_PYNV_DECODER_CACHE_SIZE"] = str(decoder_cache_size)
     try:
         ctypes.CDLL("libnvcuvid.so.1")
     except OSError as exc:
@@ -160,7 +164,7 @@ def register_pynv_video_reader(
                     # full metadata scan before use. Runtime decoding therefore
                     # trusts container metadata for both source and override paths.
                     need_scanned_stream_metadata=False,
-                    decoder_cache_size=4,
+                    decoder_cache_size=decoder_cache_size,
                     output_color_type=nvc.OutputColorType.RGB,
                 )
                 cuda_state["decoder"] = decoder
@@ -319,6 +323,7 @@ def register_pynv_video_reader(
         "backend": "pynvvideocodec",
         "version": getattr(nvc, "__version__", "unknown"),
         "cache_size": cache_size,
+        "decoder_cache_size": decoder_cache_size,
         "cache_boundary": "processed_fetch_video",
         "video_overrides": len(overrides),
         "strict": strict,

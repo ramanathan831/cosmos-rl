@@ -125,6 +125,7 @@ def test_gpu_reader_reuses_context_stream_and_decoder(tmp_path, monkeypatch, cap
 
     profile = register_pynv_video_reader(
         cache_size=0,
+        decoder_cache_size=37,
         video_override_map=str(override_map),
         strict=True,
     )
@@ -137,7 +138,7 @@ def test_gpu_reader_reuses_context_stream_and_decoder(tmp_path, monkeypatch, cap
     assert decoder_options[0]["gpu_id"] == 0
     assert decoder_options[0]["cuda_context"] == 20
     assert decoder_options[0]["cuda_stream"] == 33
-    assert decoder_options[0]["decoder_cache_size"] == 4
+    assert decoder_options[0]["decoder_cache_size"] == 37
     assert decoder_options[0]["need_scanned_stream_metadata"] is False
     assert tuple(first.shape) == (8, 3, 2, 2)
     assert metadata["video_backend"] == "pynvvideocodec"
@@ -145,6 +146,7 @@ def test_gpu_reader_reuses_context_stream_and_decoder(tmp_path, monkeypatch, cap
         "backend": "pynvvideocodec",
         "version": "2.2.0",
         "cache_size": 0,
+        "decoder_cache_size": 37,
         "cache_boundary": "processed_fetch_video",
         "video_overrides": 1,
         "strict": True,
@@ -164,12 +166,17 @@ def test_gpu_reader_exports_spawn_worker_contract(tmp_path, monkeypatch):
             pass
 
     vision = _install_fake_runtime(monkeypatch, Decoder)
-    register_pynv_video_reader(cache_size=4, strict=True)
+    register_pynv_video_reader(
+        cache_size=4,
+        decoder_cache_size=19,
+        strict=True,
+    )
 
     assert vision.FORCE_QWENVL_VIDEO_READER == "pynvvideocodec"
     assert pynv_video_reader.os.environ["FORCE_QWENVL_VIDEO_READER"] == "pynvvideocodec"
     assert pynv_video_reader.os.environ["TAO_PYNV_VIDEO_STRICT"] == "1"
     assert pynv_video_reader.os.environ["TAO_PYNV_VIDEO_CACHE_SIZE"] == "4"
+    assert pynv_video_reader.os.environ["TAO_PYNV_DECODER_CACHE_SIZE"] == "19"
     with pytest.raises(RuntimeError, match="CPU video decoding fallback"):
         vision.VIDEO_READER_BACKENDS["torchvision"]({"video": str(video)})
 

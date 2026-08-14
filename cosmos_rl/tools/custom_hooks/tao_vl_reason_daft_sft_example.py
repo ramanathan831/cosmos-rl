@@ -125,6 +125,7 @@ class CustomConfig(pydantic.BaseModel):
     system_prompt: str = ""
     video_decoder: Literal["pynvvideocodec", "cpu"] = "pynvvideocodec"
     video_cache_size: int = pydantic.Field(default=2, ge=0)
+    video_decoder_cache_size: int = pydantic.Field(default=4, ge=1)
     video_override_map: str | None = None
     vision: VisionConfig = pydantic.Field(
         default=VisionConfig(
@@ -363,6 +364,7 @@ def main():
 
         decoder_info = register_pynv_video_reader(
             cache_size=custom_config.video_cache_size,
+            decoder_cache_size=custom_config.video_decoder_cache_size,
             video_override_map=custom_config.video_override_map,
         )
         logger.info("GPU video decoder registered: %s", decoder_info)
