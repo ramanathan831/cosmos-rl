@@ -353,6 +353,7 @@ def configure_video_decoder(custom_config: CustomConfig) -> dict[str, object] | 
     if os.environ.get("COSMOS_ROLE") == "Controller":
         return None
     if custom_config.video_decoder == "pynvvideocodec":
+        os.environ.pop("COSMOS_DATALOADER_VIDEO_DECODER", None)
         from cosmos_rl.utils.pynv_video_reader import register_pynv_video_reader
 
         decoder_info = register_pynv_video_reader(
@@ -362,6 +363,7 @@ def configure_video_decoder(custom_config: CustomConfig) -> dict[str, object] | 
         logger.info("GPU video decoder registered: %s", decoder_info)
         return decoder_info
     if custom_config.video_decoder in ("cpu", "torchvision"):
+        os.environ["COSMOS_DATALOADER_VIDEO_DECODER"] = "system_pyav"
         from cosmos_rl.utils.system_pyav_video_reader import (
             register_system_pyav_video_reader,
         )

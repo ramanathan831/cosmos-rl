@@ -58,6 +58,27 @@ def _is_pp_enabled(parallel_dims) -> bool:
     return bool(getattr(parallel_dims, "pp_enabled", False))
 
 
+def _initialize_dataloader_worker(worker_id: int) -> None:
+    """Restore process-local video hooks after a spawn-based worker start."""
+    video_decoder = os.environ.get("COSMOS_DATALOADER_VIDEO_DECODER")
+    if video_decoder is None:
+        return
+    if video_decoder != "system_pyav":
+        raise RuntimeError(
+            "unsupported COSMOS_DATALOADER_VIDEO_DECODER value: "
+            f"{video_decoder}"
+        )
+
+    from cosmos_rl.utils.system_pyav_video_reader import (
+        register_system_pyav_video_reader,
+    )
+
+    register_system_pyav_video_reader()
+    logger.info(
+        "DataLoader worker %s registered System PyAV video decoder", worker_id
+    )
+
+
 def _dataloader_worker_kwargs(
     num_workers: int, prefetch_factor: Optional[int]
 ) -> Dict[str, Any]:
@@ -71,6 +92,8 @@ def _dataloader_worker_kwargs(
     kwargs: Dict[str, Any] = {"num_workers": num_workers}
     if num_workers > 0:
         kwargs["multiprocessing_context"] = "spawn"
+        if os.environ.get("COSMOS_DATALOADER_VIDEO_DECODER") is not None:
+            kwargs["worker_init_fn"] = _initialize_dataloader_worker
         if prefetch_factor is not None:
             kwargs["prefetch_factor"] = prefetch_factor
     return kwargs

@@ -33,6 +33,7 @@ def test_system_decoder_is_registered_outside_controller(
         "requested": video_decoder,
     }
     assert calls == [video_decoder]
+    assert hook.os.environ["COSMOS_DATALOADER_VIDEO_DECODER"] == "system_pyav"
 
 
 def test_controller_does_not_register_system_decoder(monkeypatch):
@@ -58,3 +59,4 @@ def test_pynv_decoder_registration_is_unchanged(monkeypatch):
 
     assert hook.configure_video_decoder(_config("pynvvideocodec")) == expected
     assert calls == [{"cache_size": 2, "video_override_map": None}]
+    assert "COSMOS_DATALOADER_VIDEO_DECODER" not in hook.os.environ
