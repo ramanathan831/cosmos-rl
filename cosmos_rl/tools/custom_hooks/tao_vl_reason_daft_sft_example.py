@@ -123,7 +123,7 @@ class CustomConfig(pydantic.BaseModel):
     train_dataset: CustomDatasetConfig = pydantic.Field()
     val_dataset: CustomDatasetConfig | None = None
     system_prompt: str = ""
-    video_decoder: Literal["pynvvideocodec", "cpu"] = "pynvvideocodec"
+    video_decoder: Literal["pynvvideocodec", "cpu", "torchvision"] = "pynvvideocodec"
     video_cache_size: int = pydantic.Field(default=2, ge=0)
     video_override_map: str | None = None
     vision: VisionConfig = pydantic.Field(
@@ -348,6 +348,37 @@ def get_data_packer(config: cosmos_rl.policy.config.Config) -> BaseDataPacker:
     return TaoVlReasonHFVLMDataPacker()
 
 
+def configure_video_decoder(custom_config: CustomConfig) -> dict[str, object] | None:
+    """Register the decoder selected by the DAFT runtime contract."""
+    if os.environ.get("COSMOS_ROLE") == "Controller":
+        return None
+    if custom_config.video_decoder == "pynvvideocodec":
+        from cosmos_rl.utils.pynv_video_reader import register_pynv_video_reader
+
+        decoder_info = register_pynv_video_reader(
+            cache_size=custom_config.video_cache_size,
+            video_override_map=custom_config.video_override_map,
+        )
+        logger.info("GPU video decoder registered: %s", decoder_info)
+        return decoder_info
+    if custom_config.video_decoder in ("cpu", "torchvision"):
+        from cosmos_rl.utils.system_pyav_video_reader import (
+            register_system_pyav_video_reader,
+        )
+
+        register_system_pyav_video_reader()
+        decoder_info = {
+            "backend": "torchvision",
+            "implementation": "system_pyav_sparse",
+            "requested": custom_config.video_decoder,
+        }
+        logger.info("System PyAV video decoder registered: %s", decoder_info)
+        return decoder_info
+    raise ValueError(
+        "custom.video_decoder must be pynvvideocodec, torchvision, or cpu"
+    )
+
+
 @monitor_status(name="Cosmos-RL TAO VL Reason DAFT", mode="sft")
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -358,14 +389,7 @@ def main():
         config_kwargs = toml.load(f)
     config = cosmos_rl.policy.config.Config.from_dict(config_kwargs)
     custom_config = CustomConfig.model_validate(config_kwargs.get("custom", {}))
-    if custom_config.video_decoder == "pynvvideocodec" and os.environ.get("COSMOS_ROLE") != "Controller":
-        from cosmos_rl.utils.pynv_video_reader import register_pynv_video_reader
-
-        decoder_info = register_pynv_video_reader(
-            cache_size=custom_config.video_cache_size,
-            video_override_map=custom_config.video_override_map,
-        )
-        logger.info("GPU video decoder registered: %s", decoder_info)
+    configure_video_decoder(custom_config)
 
     if os.environ.get("COSMOS_ROLE") == "Controller":
         output_dir = Path(config.train.output_dir).resolve().parent
