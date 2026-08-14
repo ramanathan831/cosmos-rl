@@ -29,6 +29,9 @@ def _install_fake_runtime(monkeypatch, decoder_type):
         smart_nframes=lambda _element, **_kwargs: 8,
         get_video_reader_backend=SimpleNamespace(cache_clear=lambda: None),
     )
+    vision.fetch_video = lambda element, **_kwargs: vision.VIDEO_READER_BACKENDS[
+        vision.FORCE_QWENVL_VIDEO_READER
+    ](element)
     driver = SimpleNamespace(
         cuInit=lambda _flags: (0,),
         cuDeviceGet=lambda ordinal: (0, ordinal + 10),
@@ -142,6 +145,7 @@ def test_gpu_reader_reuses_context_stream_and_decoder(tmp_path, monkeypatch, cap
         "backend": "pynvvideocodec",
         "version": "2.2.0",
         "cache_size": 0,
+        "cache_boundary": "processed_fetch_video",
         "video_overrides": 1,
         "strict": True,
     }
@@ -168,3 +172,51 @@ def test_gpu_reader_exports_spawn_worker_contract(tmp_path, monkeypatch):
     assert pynv_video_reader.os.environ["TAO_PYNV_VIDEO_CACHE_SIZE"] == "4"
     with pytest.raises(RuntimeError, match="CPU video decoding fallback"):
         vision.VIDEO_READER_BACKENDS["torchvision"]({"video": str(video)})
+
+
+def test_gpu_reader_caches_processed_fetch_result(tmp_path, monkeypatch):
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"video")
+    decode_calls = 0
+
+    class Decoder:
+        def __init__(self, _path, **_kwargs):
+            pass
+
+        def get_stream_metadata(self):
+            return SimpleNamespace(average_fps=30.0)
+
+        def __len__(self):
+            return 8
+
+        def get_batch_frames_by_index(self, indices):
+            nonlocal decode_calls
+            decode_calls += 1
+
+            class Frame:
+                shape = (2, 2, 3)
+                strides = (6, 3, 1)
+
+                def __init__(self):
+                    self.value = np.zeros((2, 2, 3), dtype=np.uint8).ctypes
+
+                def framesize(self):
+                    return 12
+
+                def GetPtrToPlane(self, _index):
+                    return self.value.data
+
+            return [Frame() for _ in indices]
+
+        def stop(self):
+            pass
+
+    vision = _install_fake_runtime(monkeypatch, Decoder)
+    profile = register_pynv_video_reader(cache_size=2, strict=True)
+    element = {"video": str(video), "nframes": 8, "max_pixels": 81920}
+    first = vision.fetch_video(element, return_video_metadata=True)
+    second = vision.fetch_video(element, return_video_metadata=True)
+
+    assert first is second
+    assert decode_calls == 1
+    assert profile["cache_boundary"] == "processed_fetch_video"
