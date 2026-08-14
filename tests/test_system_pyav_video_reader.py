@@ -52,6 +52,7 @@ def test_tao_wts_hook_accepts_explicit_torchvision_contract(monkeypatch):
         "backend": "torchvision",
         "implementation": "system_pyav_sparse",
     }
+    assert reader.os.environ["COSMOS_DATALOADER_VIDEO_DECODER"] == "system_pyav"
 
 
 def test_tao_wts_hook_rejects_implicit_torchvision_contract(monkeypatch):

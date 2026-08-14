@@ -119,6 +119,7 @@ def configure_video_decoder(custom_config: CustomConfig) -> dict[str, object]:
         custom_config.video_decoder == "pynvvideocodec"
         and os.environ.get("COSMOS_ROLE") != "Controller"
     ):
+        os.environ.pop("COSMOS_DATALOADER_VIDEO_DECODER", None)
         from cosmos_rl.utils.pynv_video_reader import register_pynv_video_reader
 
         return register_pynv_video_reader(
@@ -131,6 +132,7 @@ def configure_video_decoder(custom_config: CustomConfig) -> dict[str, object]:
                 "custom.video_decoder=torchvision requires "
                 "FORCE_QWENVL_VIDEO_READER=torchvision"
             )
+        os.environ["COSMOS_DATALOADER_VIDEO_DECODER"] = "system_pyav"
         register_system_pyav_video_reader()
         return {"backend": "torchvision", "implementation": "system_pyav_sparse"}
     if (
