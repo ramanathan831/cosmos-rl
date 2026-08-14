@@ -47,7 +47,8 @@ import torch.utils.data
 from cosmos_rl.utils.logging import logger
 from cosmos_rl.utils.system_pyav_video_reader import register_system_pyav_video_reader
 
-register_system_pyav_video_reader()
+if os.environ.get("FORCE_QWENVL_VIDEO_READER") != "pynvvideocodec":
+    register_system_pyav_video_reader()
 
 # Import TAO status logger utilities
 from cosmos_rl.tools.custom_hooks import TAOStatusLogger

@@ -1,25 +1,95 @@
+import importlib.util
 import json
+from pathlib import Path
 import sys
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
-from cosmos_rl.utils.pynv_video_reader import register_pynv_video_reader
+
+SCRIPT = Path(__file__).parents[1] / "cosmos_rl" / "utils" / "pynv_video_reader.py"
+SPEC = importlib.util.spec_from_file_location("pynv_video_reader", SCRIPT)
+assert SPEC and SPEC.loader
+pynv_video_reader = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(pynv_video_reader)
+register_pynv_video_reader = pynv_video_reader.register_pynv_video_reader
 
 
-def test_scanned_metadata_is_limited_to_override_targets(tmp_path, monkeypatch):
+def _install_fake_runtime(monkeypatch, decoder_type):
+    vision = SimpleNamespace(
+        VIDEO_READER_BACKENDS={},
+        FORCE_QWENVL_VIDEO_READER=None,
+        calculate_video_frame_range=lambda _element, total, _fps: (
+            0,
+            total - 1,
+            total,
+        ),
+        smart_nframes=lambda _element, **_kwargs: 8,
+        get_video_reader_backend=SimpleNamespace(cache_clear=lambda: None),
+    )
+    driver = SimpleNamespace(
+        cuInit=lambda _flags: (0,),
+        cuDeviceGet=lambda ordinal: (0, ordinal + 10),
+        cuDevicePrimaryCtxRetain=lambda device: (0, device + 10),
+        cuCtxSetCurrent=lambda _context: (0,),
+        cuStreamCreate=lambda _flags: (0, 33),
+        cuStreamDestroy=lambda _stream: (0,),
+        cuDevicePrimaryCtxRelease=lambda _device: (0,),
+    )
+    cuda_module = ModuleType("cuda")
+    bindings_module = ModuleType("cuda.bindings")
+    bindings_module.driver = driver
+    cuda_module.bindings = bindings_module
+
+    monkeypatch.setattr("ctypes.CDLL", lambda *_args: object())
+    monkeypatch.setattr(
+        pynv_video_reader.atexit,
+        "register",
+        lambda _callback: None,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "PyNvVideoCodec",
+        SimpleNamespace(
+            SimpleDecoder=decoder_type,
+            OutputColorType=SimpleNamespace(RGB="rgb"),
+            __version__="2.2.0",
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "qwen_vl_utils.vision_process", vision)
+    monkeypatch.setitem(
+        sys.modules,
+        "qwen_vl_utils",
+        SimpleNamespace(vision_process=vision),
+    )
+    monkeypatch.setitem(sys.modules, "cuda", cuda_module)
+    monkeypatch.setitem(sys.modules, "cuda.bindings", bindings_module)
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    return vision
+
+
+def test_gpu_reader_reuses_context_stream_and_decoder(tmp_path, monkeypatch, capsys):
     target = tmp_path / "override.mp4"
     ordinary = tmp_path / "ordinary.mp4"
     target.write_bytes(b"video")
     ordinary.write_bytes(b"video")
     override_map = tmp_path / "overrides.json"
-    override_map.write_text(json.dumps({"logical.mp4": str(target)}))
-    options = []
+    override_map.write_text(
+        json.dumps({"logical.mp4": str(target)}),
+        encoding="utf-8",
+    )
+    decoder_paths = []
+    decoder_options = []
 
     class Decoder:
-        def __init__(self, _path, **kwargs):
-            options.append(kwargs)
+        def __init__(self, path, **kwargs):
+            decoder_paths.append(str(path))
+            decoder_options.append(kwargs)
+
+        def reconfigure_decoder(self, path):
+            decoder_paths.append(str(path))
 
         def get_stream_metadata(self):
             return SimpleNamespace(average_fps=30.0)
@@ -43,21 +113,58 @@ def test_scanned_metadata_is_limited_to_override_targets(tmp_path, monkeypatch):
 
             return [Frame() for _ in indices]
 
-    vision = SimpleNamespace(
-        VIDEO_READER_BACKENDS={}, FORCE_QWENVL_VIDEO_READER=None,
-        calculate_video_frame_range=lambda _element, total, _fps: (0, total - 1, total),
-        smart_nframes=lambda _element, **_kwargs: 8,
-        get_video_reader_backend=SimpleNamespace(cache_clear=lambda: None),
+        def stop(self):
+            return None
+
+    vision = _install_fake_runtime(monkeypatch, Decoder)
+    monkeypatch.setenv("LOCAL_RANK", "3")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "7")
+
+    profile = register_pynv_video_reader(
+        cache_size=0,
+        video_override_map=str(override_map),
+        strict=True,
     )
-    monkeypatch.setattr("ctypes.CDLL", lambda *_args: object())
-    monkeypatch.setitem(sys.modules, "PyNvVideoCodec", SimpleNamespace(
-        SimpleDecoder=Decoder, OutputColorType=SimpleNamespace(RGB="rgb"), __version__="2.2.0",
-    ))
-    monkeypatch.setitem(sys.modules, "qwen_vl_utils.vision_process", vision)
-    monkeypatch.setitem(sys.modules, "qwen_vl_utils", SimpleNamespace(vision_process=vision))
-    register_pynv_video_reader(video_override_map=str(override_map))
     reader = vision.VIDEO_READER_BACKENDS["pynvvideocodec"]
-    reader({"video": "logical.mp4", "nframes": 8})
+    first, metadata, _sample_fps = reader({"video": "logical.mp4", "nframes": 8})
     reader({"video": str(ordinary), "nframes": 8})
-    assert options[0]["need_scanned_stream_metadata"] is False
-    assert options[1]["need_scanned_stream_metadata"] is False
+
+    assert decoder_paths == [str(target), str(ordinary)]
+    assert len(decoder_options) == 1
+    assert decoder_options[0]["gpu_id"] == 0
+    assert decoder_options[0]["cuda_context"] == 20
+    assert decoder_options[0]["cuda_stream"] == 33
+    assert decoder_options[0]["decoder_cache_size"] == 4
+    assert decoder_options[0]["need_scanned_stream_metadata"] is False
+    assert tuple(first.shape) == (8, 3, 2, 2)
+    assert metadata["video_backend"] == "pynvvideocodec"
+    assert profile == {
+        "backend": "pynvvideocodec",
+        "version": "2.2.0",
+        "cache_size": 0,
+        "video_overrides": 1,
+        "strict": True,
+    }
+    assert capsys.readouterr().out.count("TAO_GPU_VIDEO_DECODE_ATTESTATION") == 1
+
+
+def test_gpu_reader_exports_spawn_worker_contract(tmp_path, monkeypatch):
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"video")
+
+    class Decoder:
+        def __init__(self, _path, **_kwargs):
+            pass
+
+        def stop(self):
+            pass
+
+    vision = _install_fake_runtime(monkeypatch, Decoder)
+    register_pynv_video_reader(cache_size=4, strict=True)
+
+    assert vision.FORCE_QWENVL_VIDEO_READER == "pynvvideocodec"
+    assert pynv_video_reader.os.environ["FORCE_QWENVL_VIDEO_READER"] == "pynvvideocodec"
+    assert pynv_video_reader.os.environ["TAO_PYNV_VIDEO_STRICT"] == "1"
+    assert pynv_video_reader.os.environ["TAO_PYNV_VIDEO_CACHE_SIZE"] == "4"
+    with pytest.raises(RuntimeError, match="CPU video decoding fallback"):
+        vision.VIDEO_READER_BACKENDS["torchvision"]({"video": str(video)})

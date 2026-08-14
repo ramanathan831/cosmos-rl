@@ -5,8 +5,10 @@
 
 from __future__ import annotations
 
+import atexit
 import ctypes
 import json
+import os
 import threading
 from collections import OrderedDict
 from pathlib import Path
@@ -15,46 +17,128 @@ from typing import Any
 
 def register_pynv_video_reader(
     *,
-    cache_size: int = 2,
+    cache_size: int = 0,
     video_override_map: str | None = None,
+    strict: bool = True,
 ) -> dict[str, Any]:
-    """Register a repository-supported ``pynvvideocodec`` Qwen backend.
-
-    Raises during preflight/initialization if NVDEC is unavailable; it never
-    silently falls back to CPU decoding. Relative media resolution remains the
-    dataset adapter's responsibility.
-    """
+    """Register a Qwen NVDEC reader and optionally forbid CPU fallback."""
     if cache_size < 0:
         raise ValueError("cache_size must be non-negative")
+    # DataLoader workers use the spawn start method, so parent-process monkey
+    # patches are not inherited.  Export the complete registration contract so
+    # the baked qwen-vl-utils worker hook can recreate this reader in every
+    # spawned worker before its first decode.
+    os.environ["FORCE_QWENVL_VIDEO_READER"] = "pynvvideocodec"
+    os.environ["TAO_PYNV_VIDEO_STRICT"] = "1" if strict else "0"
+    os.environ["TAO_PYNV_VIDEO_CACHE_SIZE"] = str(cache_size)
     try:
         ctypes.CDLL("libnvcuvid.so.1")
     except OSError as exc:
-        raise RuntimeError("GPU video decoding requires readable libnvcuvid.so.1") from exc
+        raise RuntimeError(
+            "GPU video decoding requires readable libnvcuvid.so.1"
+        ) from exc
     try:
         import numpy as np
         import PyNvVideoCodec as nvc
         import qwen_vl_utils.vision_process as vision_process
         import torch
+        from cuda.bindings import driver as cuda_driver
     except ImportError as exc:
-        raise RuntimeError("GPU video decoding requires PyNvVideoCodec and qwen-vl-utils") from exc
+        raise RuntimeError(
+            "GPU video decoding requires PyNvVideoCodec, cuda.bindings, and qwen-vl-utils"
+        ) from exc
 
     overrides: dict[str, str] = {}
     if video_override_map:
         override_path = Path(video_override_map).expanduser().resolve(strict=True)
         value = json.loads(override_path.read_text(encoding="utf-8"))
-        if not isinstance(value, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in value.items()):
+        if not isinstance(value, dict) or not all(
+            isinstance(key, str) and isinstance(item, str)
+            for key, item in value.items()
+        ):
             raise ValueError("video_override_map must be a JSON object of string paths")
         overrides = value
+        os.environ["TAO_PYNV_VIDEO_OVERRIDE_MAP"] = str(override_path)
+    else:
+        os.environ.pop("TAO_PYNV_VIDEO_OVERRIDE_MAP", None)
     video_cache: OrderedDict[tuple[Any, ...], Any] = OrderedDict()
     decoder_lock = threading.RLock()
+    cuda_state: dict[str, Any] = {}
+    decode_attested = False
+
+    def cuda_check(result, operation):
+        error, *values = result
+        if int(error) != 0:
+            raise RuntimeError(f"{operation} failed: {error}")
+        return values[0] if len(values) == 1 else tuple(values)
+
+    def decoder_gpu_ordinal() -> int:
+        """Return the process-visible GPU ordinal for this policy rank."""
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        visible = [
+            token.strip()
+            for token in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
+            if token.strip()
+        ]
+        # A launcher may expose one physical GPU per policy process. CUDA then
+        # remaps that device to process-local ordinal zero even when LOCAL_RANK
+        # retains the node-global rank.
+        return 0 if len(visible) == 1 else local_rank
+
+    def cleanup_cuda_state() -> None:
+        decoder = cuda_state.pop("decoder", None)
+        cuda_state.pop("decoder_path", None)
+        stream = cuda_state.pop("stream", None)
+        device = cuda_state.pop("device", None)
+        cuda_state.pop("context", None)
+        if decoder is not None:
+            try:
+                decoder.stop()
+            except Exception:
+                pass
+            del decoder
+        if stream is not None:
+            cuda_driver.cuStreamDestroy(stream)
+        if device is not None:
+            cuda_driver.cuCtxSetCurrent(None)
+            cuda_driver.cuDevicePrimaryCtxRelease(device)
+
+    def get_cuda_state() -> tuple[int, int, int]:
+        """Retain one primary context and stream per spawned data worker."""
+        if cuda_state:
+            return (
+                int(cuda_state["context"]),
+                int(cuda_state["stream"]),
+                int(cuda_state["gpu_id"]),
+            )
+        cuda_check(cuda_driver.cuInit(0), "cuInit")
+        gpu_id = decoder_gpu_ordinal()
+        device = cuda_check(cuda_driver.cuDeviceGet(gpu_id), "cuDeviceGet")
+        context = cuda_check(
+            cuda_driver.cuDevicePrimaryCtxRetain(device),
+            "cuDevicePrimaryCtxRetain",
+        )
+        cuda_check(cuda_driver.cuCtxSetCurrent(context), "cuCtxSetCurrent")
+        stream = cuda_check(cuda_driver.cuStreamCreate(0), "cuStreamCreate")
+        cuda_state.update(
+            device=device,
+            context=context,
+            stream=stream,
+            gpu_id=gpu_id,
+        )
+        atexit.register(cleanup_cuda_state)
+        return int(context), int(stream), gpu_id
 
     def read_video_pynv(element):
+        nonlocal decode_attested
         with decoder_lock:
-            video_path = element["video"]
+            video_path = str(element["video"])
             if video_path.startswith("file://"):
                 video_path = video_path[7:]
             if video_path.startswith(("http://", "https://")):
-                raise ValueError("PyNvVideoCodec training requires compute-node-accessible local media")
+                raise ValueError(
+                    "PyNvVideoCodec evaluation requires compute-node-local media"
+                )
             video_path = overrides.get(video_path, video_path)
             video_path = str(Path(video_path).expanduser().resolve(strict=True))
             key = (
@@ -71,48 +155,68 @@ def register_pynv_video_reader(
                 video_cache[key] = cached
                 return cached
 
-            import os
-
-            gpu_id = int(os.environ.get("LOCAL_RANK", "0"))
-            decoder = nvc.SimpleDecoder(
-                video_path,
-                gpu_id=gpu_id,
-                use_device_memory=False,
-                # Prepared override streams are deterministic H.264/MP4
-                # artifacts whose header frame counts are validated against a
-                # full metadata scan before use. Re-scanning those streams in
-                # every data-loader process can deadlock PyNvVideoCodec under
-                # high-rank cache prewarming, so runtime decoding trusts the
-                # validated container metadata for both source and override
-                # paths.
-                need_scanned_stream_metadata=False,
-                output_color_type=nvc.OutputColorType.RGB,
+            cuda_context, cuda_stream, gpu_id = get_cuda_state()
+            cuda_check(
+                cuda_driver.cuCtxSetCurrent(cuda_state["context"]), "cuCtxSetCurrent"
             )
-            try:
-                metadata = decoder.get_stream_metadata()
-                source_total_frames = len(decoder)
-                video_fps = float(metadata.average_fps)
-                start_frame, end_frame, selected_total_frames = vision_process.calculate_video_frame_range(
+            decoder = cuda_state.get("decoder")
+            if decoder is None:
+                decoder = nvc.SimpleDecoder(
+                    video_path,
+                    gpu_id=gpu_id,
+                    cuda_context=cuda_context,
+                    cuda_stream=cuda_stream,
+                    use_device_memory=False,
+                    # Prepared override streams are deterministic H.264/MP4
+                    # artifacts whose header frame counts are validated against a
+                    # full metadata scan before use. Runtime decoding therefore
+                    # trusts container metadata for both source and override paths.
+                    need_scanned_stream_metadata=False,
+                    decoder_cache_size=4,
+                    output_color_type=nvc.OutputColorType.RGB,
+                )
+                cuda_state["decoder"] = decoder
+                cuda_state["decoder_path"] = video_path
+            elif cuda_state["decoder_path"] != video_path:
+                # Keep the package's native decoder/session cache alive across
+                # samples. Reconstructing SimpleDecoder per video makes libav
+                # repeatedly create and destroy CUDA contexts under spawned
+                # distributed data workers.
+                decoder.reconfigure_decoder(video_path)
+                cuda_state["decoder_path"] = video_path
+
+            metadata = decoder.get_stream_metadata()
+            source_total_frames = len(decoder)
+            video_fps = float(metadata.average_fps)
+            start_frame, end_frame, selected_total_frames = (
+                vision_process.calculate_video_frame_range(
                     element, source_total_frames, video_fps
                 )
-                nframes = vision_process.smart_nframes(
-                    element, total_frames=selected_total_frames, video_fps=video_fps
-                )
-                indices = torch.linspace(start_frame, end_frame, nframes).round().long().tolist()
-                arrays = []
-                for frame in decoder.get_batch_frames_by_index(indices):
-                    shape = tuple(int(value) for value in frame.shape)
-                    strides = tuple(int(value) for value in frame.strides)
-                    if len(shape) != 3 or shape[2] != 3:
-                        raise RuntimeError(f"unexpected RGB frame layout {shape} for {video_path}")
-                    raw = np.ctypeslib.as_array(
-                        ctypes.cast(frame.GetPtrToPlane(0), ctypes.POINTER(ctypes.c_uint8)),
-                        shape=(int(frame.framesize()),),
+            )
+            nframes = vision_process.smart_nframes(
+                element, total_frames=selected_total_frames, video_fps=video_fps
+            )
+            indices = (
+                torch.linspace(start_frame, end_frame, nframes).round().long().tolist()
+            )
+            arrays = []
+            for frame in decoder.get_batch_frames_by_index(indices):
+                shape = tuple(int(value) for value in frame.shape)
+                strides = tuple(int(value) for value in frame.strides)
+                if len(shape) != 3 or shape[2] != 3:
+                    raise RuntimeError(
+                        f"unexpected RGB frame layout {shape} for {video_path}"
                     )
-                    arrays.append(np.ndarray(shape=shape, dtype=np.uint8, buffer=raw, strides=strides).copy())
-                video = torch.from_numpy(np.stack(arrays)).permute(0, 3, 1, 2).contiguous()
-            finally:
-                del decoder
+                raw = np.ctypeslib.as_array(
+                    ctypes.cast(frame.GetPtrToPlane(0), ctypes.POINTER(ctypes.c_uint8)),
+                    shape=(int(frame.framesize()),),
+                )
+                arrays.append(
+                    np.ndarray(
+                        shape=shape, dtype=np.uint8, buffer=raw, strides=strides
+                    ).copy()
+                )
+            video = torch.from_numpy(np.stack(arrays)).permute(0, 3, 1, 2).contiguous()
             sample_fps = nframes / max(selected_total_frames, 1.0) * video_fps
             result = (
                 video,
@@ -124,6 +228,18 @@ def register_pynv_video_reader(
                 },
                 sample_fps,
             )
+            if not decode_attested:
+                worker_info = torch.utils.data.get_worker_info()
+                worker_id = worker_info.id if worker_info is not None else -1
+                print(
+                    "TAO_GPU_VIDEO_DECODE_ATTESTATION "
+                    f"backend=pynvvideocodec pid={os.getpid()} "
+                    f"local_rank={os.environ.get('LOCAL_RANK', '0')} "
+                    f"worker_id={worker_id} gpu_ordinal={gpu_id} "
+                    f"decoded_frames={len(indices)}",
+                    flush=True,
+                )
+                decode_attested = True
             if cache_size:
                 video_cache[key] = result
                 while len(video_cache) > cache_size:
@@ -131,6 +247,14 @@ def register_pynv_video_reader(
             return result
 
     vision_process.VIDEO_READER_BACKENDS["pynvvideocodec"] = read_video_pynv
+    if strict:
+
+        def reject_cpu_fallback(_element):
+            raise RuntimeError(
+                "CPU video decoding fallback is disabled for this regression"
+            )
+
+        vision_process.VIDEO_READER_BACKENDS["torchvision"] = reject_cpu_fallback
     vision_process.FORCE_QWENVL_VIDEO_READER = "pynvvideocodec"
     vision_process.get_video_reader_backend.cache_clear()
     return {
@@ -138,4 +262,5 @@ def register_pynv_video_reader(
         "version": getattr(nvc, "__version__", "unknown"),
         "cache_size": cache_size,
         "video_overrides": len(overrides),
+        "strict": strict,
     }

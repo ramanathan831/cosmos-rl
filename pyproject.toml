@@ -118,6 +118,7 @@ rl = [
 
 tao = [
     "nvidia-tao-daft>=2.9.1",
+    "pynvvideocodec==2.2.0",
 ]
 
 # Lightweight extra for non-LLM RL workloads (e.g. Gymnasium-based

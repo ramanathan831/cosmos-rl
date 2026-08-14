@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import importlib.util
 import inspect
 from pathlib import Path
 import subprocess
@@ -25,6 +26,81 @@ _DEEPEP_REQUIRED_SYMBOLS = (
     "internode_ll::query_mask_buffer",
     "internode_ll::update_mask_buffer",
 )
+_QWEN_FORCE_ANCHOR = (
+    'FORCE_QWENVL_VIDEO_READER = os.getenv("FORCE_QWENVL_VIDEO_READER", None)\n'
+)
+_QWEN_WORKER_HELPERS = '''
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _ensure_forced_video_reader(video_reader_backend: str) -> None:
+    """Install the baked GPU reader inside spawned DataLoader workers."""
+    if video_reader_backend != "pynvvideocodec":
+        return
+    if video_reader_backend in VIDEO_READER_BACKENDS:
+        return
+
+    from cosmos_rl.utils.pynv_video_reader import register_pynv_video_reader
+
+    register_pynv_video_reader(
+        cache_size=int(os.getenv("TAO_PYNV_VIDEO_CACHE_SIZE", "0")),
+        video_override_map=os.getenv("TAO_PYNV_VIDEO_OVERRIDE_MAP") or None,
+        strict=_env_flag("TAO_PYNV_VIDEO_STRICT", True),
+    )
+    if video_reader_backend not in VIDEO_READER_BACKENDS:
+        raise RuntimeError(
+            "pynvvideocodec registration completed without installing its Qwen backend"
+        )
+'''
+_QWEN_OLD_BACKEND = """@lru_cache(maxsize=1)
+def get_video_reader_backend() -> str:
+    if FORCE_QWENVL_VIDEO_READER is not None:
+        video_reader_backend = FORCE_QWENVL_VIDEO_READER
+    elif is_torchcodec_available():
+        video_reader_backend = "torchcodec"
+    elif is_decord_available():
+        video_reader_backend = "decord"
+    else:
+        video_reader_backend = "torchvision"
+    print(f"qwen-vl-utils using {video_reader_backend} to read video.", file=sys.stderr)
+    return video_reader_backend
+"""
+_QWEN_NEW_BACKEND = """@lru_cache(maxsize=1)
+def get_video_reader_backend() -> str:
+    forced_video_reader = os.getenv(
+        "FORCE_QWENVL_VIDEO_READER", FORCE_QWENVL_VIDEO_READER
+    )
+    if forced_video_reader is not None:
+        video_reader_backend = forced_video_reader
+    elif is_torchcodec_available():
+        video_reader_backend = "torchcodec"
+    elif is_decord_available():
+        video_reader_backend = "decord"
+    else:
+        video_reader_backend = "torchvision"
+    _ensure_forced_video_reader(video_reader_backend)
+    print(f"qwen-vl-utils using {video_reader_backend} to read video.", file=sys.stderr)
+    return video_reader_backend
+"""
+_QWEN_OLD_FALLBACK = """        except Exception as e:
+            logger.warning(f"video_reader_backend {video_reader_backend} error, use torchvision as default, msg: {e}")
+            video, video_metadata, sample_fps = VIDEO_READER_BACKENDS["torchvision"](ele)
+"""
+_QWEN_NEW_FALLBACK = """        except Exception as e:
+            if video_reader_backend == "pynvvideocodec" or _env_flag(
+                "TAO_PYNV_VIDEO_STRICT", False
+            ):
+                raise RuntimeError(
+                    "strict GPU video decoding failed; CPU fallback is disabled"
+                ) from e
+            logger.warning(f"video_reader_backend {video_reader_backend} error, use torchvision as default, msg: {e}")
+            video, video_metadata, sample_fps = VIDEO_READER_BACKENDS["torchvision"](ele)
+"""
 
 
 def repair_vllm_conv3d_source(source: str) -> tuple[str, bool]:
@@ -46,6 +122,69 @@ def repair_vllm_conv3d_source(source: str) -> tuple[str, bool]:
 def missing_deepep_symbols(symbols: str) -> list[str]:
     """Return required DeepEP internode symbols absent from ``nm -D -C`` output."""
     return [symbol for symbol in _DEEPEP_REQUIRED_SYMBOLS if symbol not in symbols]
+
+
+def repair_qwen_pynv_worker_source(source: str) -> tuple[str, bool]:
+    """Install strict PyNvVideoCodec registration in qwen-vl-utils 0.0.14."""
+    markers = (
+        "def _ensure_forced_video_reader(",
+        "_ensure_forced_video_reader(video_reader_backend)",
+        "strict GPU video decoding failed; CPU fallback is disabled",
+    )
+    if all(marker in source for marker in markers):
+        normalized = source if source.endswith("\n") else source + "\n"
+        return normalized, normalized != source
+    if (
+        source.count(_QWEN_FORCE_ANCHOR) != 1
+        or source.count(_QWEN_OLD_BACKEND) != 1
+        or source.count(_QWEN_OLD_FALLBACK) != 1
+    ):
+        raise RuntimeError(
+            "Unrecognized qwen-vl-utils video implementation; refusing blind patch"
+        )
+    repaired = source.replace(
+        _QWEN_FORCE_ANCHOR,
+        _QWEN_FORCE_ANCHOR + _QWEN_WORKER_HELPERS,
+    )
+    repaired = repaired.replace(_QWEN_OLD_BACKEND, _QWEN_NEW_BACKEND)
+    repaired = repaired.replace(_QWEN_OLD_FALLBACK, _QWEN_NEW_FALLBACK)
+    if not repaired.endswith("\n"):
+        repaired += "\n"
+    return repaired, True
+
+
+def _qwen_vision_process_path() -> Path:
+    spec = importlib.util.find_spec("qwen_vl_utils.vision_process")
+    if spec is None or spec.origin is None:
+        raise RuntimeError("qwen-vl-utils vision_process.py is not installed")
+    return Path(spec.origin)
+
+
+def repair_qwen_pynv_worker() -> None:
+    """Patch the installed qwen-vl-utils tree during the image build."""
+    path = _qwen_vision_process_path()
+    repaired, changed = repair_qwen_pynv_worker_source(path.read_text(encoding="utf-8"))
+    if changed:
+        path.write_text(repaired, encoding="utf-8")
+        importlib.invalidate_caches()
+    verify_qwen_pynv_worker()
+
+
+def verify_qwen_pynv_worker() -> None:
+    """Verify spawned workers lazily install strict GPU video decoding."""
+    path = _qwen_vision_process_path()
+    source = path.read_text(encoding="utf-8")
+    required = (
+        "def _ensure_forced_video_reader(",
+        "_ensure_forced_video_reader(video_reader_backend)",
+        "strict GPU video decoding failed; CPU fallback is disabled",
+    )
+    missing = [marker for marker in required if marker not in source]
+    if missing:
+        raise RuntimeError(
+            "qwen-vl-utils strict GPU worker contract is missing: " + ", ".join(missing)
+        )
+    print(f"qwen-vl-utils strict GPU worker contract ready: {path}")
 
 
 def repair_vllm_conv3d() -> None:
@@ -110,8 +249,18 @@ def main() -> None:
     parser.add_argument("--repair-vllm-conv3d", action="store_true")
     parser.add_argument("--verify-vllm-conv3d", action="store_true")
     parser.add_argument("--verify-deepep", action="store_true")
+    parser.add_argument("--repair-qwen-pynv-worker", action="store_true")
+    parser.add_argument("--verify-qwen-pynv-worker", action="store_true")
     args = parser.parse_args()
-    if not any((args.repair_vllm_conv3d, args.verify_vllm_conv3d, args.verify_deepep)):
+    if not any(
+        (
+            args.repair_vllm_conv3d,
+            args.verify_vllm_conv3d,
+            args.verify_deepep,
+            args.repair_qwen_pynv_worker,
+            args.verify_qwen_pynv_worker,
+        )
+    ):
         parser.error("select at least one runtime dependency check")
     if args.repair_vllm_conv3d:
         repair_vllm_conv3d()
@@ -119,6 +268,10 @@ def main() -> None:
         verify_vllm_conv3d()
     if args.verify_deepep:
         verify_deepep()
+    if args.repair_qwen_pynv_worker:
+        repair_qwen_pynv_worker()
+    elif args.verify_qwen_pynv_worker:
+        verify_qwen_pynv_worker()
 
 
 if __name__ == "__main__":
