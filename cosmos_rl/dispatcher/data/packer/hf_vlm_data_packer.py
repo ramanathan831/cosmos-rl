@@ -37,7 +37,7 @@ from cosmos_rl.policy.config import Config
 from cosmos_rl.dispatcher.data.schema import ChatMessage
 from cosmos_rl.dispatcher.data.packer.base import DataPacker
 
-from qwen_vl_utils import fetch_image, fetch_video
+from qwen_vl_utils import fetch_image
 import qwen_vl_utils.vision_process as vision_process
 
 IGNORE_LABEL_ID = -100
@@ -133,7 +133,10 @@ def qwen_vl_process_vision_info(
                 fetch_image(vision_info, image_patch_size=image_patch_size)
             )
         elif "video" in vision_info:
-            video_input, video_sample_fps = fetch_video(
+            # Resolve fetch_video dynamically. The strict PyNvVideoCodec
+            # registration installs a lazy processed-frame cache at runtime;
+            # importing the function by value here would bypass that wrapper.
+            video_input, video_sample_fps = vision_process.fetch_video(
                 vision_info,
                 return_video_sample_fps=True,
                 image_patch_size=image_patch_size,
