@@ -61,7 +61,9 @@ def register_pynv_video_reader(
         os.environ["TAO_PYNV_VIDEO_OVERRIDE_MAP"] = str(override_path)
     else:
         os.environ.pop("TAO_PYNV_VIDEO_OVERRIDE_MAP", None)
-    video_cache: OrderedDict[tuple[Any, ...], Any] = OrderedDict()
+    processed_cache: OrderedDict[tuple[Any, ...], Any] = OrderedDict()
+    processed_inflight: dict[tuple[Any, ...], threading.Event] = {}
+    cache_lock = threading.RLock()
     decoder_lock = threading.RLock()
     cuda_state: dict[str, Any] = {}
     decode_attested = False
@@ -141,20 +143,6 @@ def register_pynv_video_reader(
                 )
             video_path = overrides.get(video_path, video_path)
             video_path = str(Path(video_path).expanduser().resolve(strict=True))
-            key = (
-                video_path,
-                element.get("video_start"),
-                element.get("video_end"),
-                element.get("nframes"),
-                element.get("fps"),
-                element.get("min_frames"),
-                element.get("max_frames"),
-            )
-            cached = video_cache.pop(key, None)
-            if cached is not None:
-                video_cache[key] = cached
-                return cached
-
             cuda_context, cuda_stream, gpu_id = get_cuda_state()
             cuda_check(
                 cuda_driver.cuCtxSetCurrent(cuda_state["context"]), "cuCtxSetCurrent"
@@ -240,13 +228,83 @@ def register_pynv_video_reader(
                     flush=True,
                 )
                 decode_attested = True
-            if cache_size:
-                video_cache[key] = result
-                while len(video_cache) > cache_size:
-                    video_cache.popitem(last=False)
             return result
 
     vision_process.VIDEO_READER_BACKENDS["pynvvideocodec"] = read_video_pynv
+
+    original_fetch_video = getattr(
+        vision_process,
+        "_tao_pynv_original_fetch_video",
+        vision_process.fetch_video,
+    )
+    vision_process._tao_pynv_original_fetch_video = original_fetch_video
+
+    def fetch_video_pynv_cached(
+        element,
+        image_patch_size=14,
+        return_video_sample_fps=False,
+        return_video_metadata=False,
+    ):
+        """Cache the fully resized Qwen result, not full-resolution RGB frames."""
+        key = tuple(
+            element.get(name)
+            for name in (
+                "video",
+                "video_start",
+                "video_end",
+                "nframes",
+                "fps",
+                "min_frames",
+                "max_frames",
+                "min_pixels",
+                "max_pixels",
+                "total_pixels",
+                "resized_height",
+                "resized_width",
+            )
+        ) + (
+            image_patch_size,
+            return_video_sample_fps,
+            return_video_metadata,
+        )
+        while True:
+            with cache_lock:
+                cached = processed_cache.get(key)
+                if cached is not None:
+                    processed_cache.move_to_end(key)
+                    return cached
+                event = processed_inflight.get(key)
+                if event is None:
+                    event = threading.Event()
+                    processed_inflight[key] = event
+                    owner = True
+                else:
+                    owner = False
+            if owner:
+                break
+            event.wait()
+
+        try:
+            result = original_fetch_video(
+                element,
+                image_patch_size=image_patch_size,
+                return_video_sample_fps=return_video_sample_fps,
+                return_video_metadata=return_video_metadata,
+            )
+            with cache_lock:
+                if cache_size:
+                    processed_cache[key] = result
+                    processed_cache.move_to_end(key)
+                    while len(processed_cache) > cache_size:
+                        processed_cache.popitem(last=False)
+            return result
+        finally:
+            with cache_lock:
+                completed = processed_inflight.pop(key, None)
+                if completed is not None:
+                    completed.set()
+
+    vision_process.fetch_video = fetch_video_pynv_cached
     if strict:
 
         def reject_cpu_fallback(_element):
@@ -261,6 +319,7 @@ def register_pynv_video_reader(
         "backend": "pynvvideocodec",
         "version": getattr(nvc, "__version__", "unknown"),
         "cache_size": cache_size,
+        "cache_boundary": "processed_fetch_video",
         "video_overrides": len(overrides),
         "strict": strict,
     }
