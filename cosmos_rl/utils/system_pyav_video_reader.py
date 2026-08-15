@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Sparse, cached Qwen video reader for the release image's system PyAV stack.
+"""Sparse, cached Qwen video reader for the release image's CPU PyAV stack.
 
 qwen-vl-utils' torchvision reader decodes every frame before selecting the
 requested samples. Long WTS clips repeat across multiple questions, which makes
@@ -32,10 +32,29 @@ _PROCESSED_CACHE: OrderedDict[tuple[Any, ...], Any] = OrderedDict()
 _PROCESSED_INFLIGHT: dict[tuple[Any, ...], threading.Event] = {}
 _ORIGINAL_FETCH_VIDEO: Any = None
 _LOCK = threading.RLock()
-# The release FFmpeg maps H.264/H.265 to CUDA decoders. Independent decoder
-# contexts created concurrently in one Python process can block each other in
-# the driver. Cache hits remain concurrent; only cold decodes are serialized.
+# PyAV codec contexts are process-local and cold seeks mutate decoder state.
+# Cache hits remain concurrent; only cold software decodes are serialized.
 _DECODE_LOCK = threading.Lock()
+
+
+def _assert_software_video_decoders() -> dict[str, str]:
+    """Fail before loading data if common codecs resolve to CUDA decoders."""
+    resolved = {
+        codec_name: av.Codec(codec_name, "r").name
+        for codec_name in ("h264", "hevc")
+    }
+    unexpected = {
+        codec_name: decoder_name
+        for codec_name, decoder_name in resolved.items()
+        if decoder_name != codec_name
+    }
+    if unexpected:
+        raise RuntimeError(
+            "System PyAV CPU decoding requires software h264/hevc codecs; "
+            f"resolved={resolved}. Install the official PyAV wheel rather than "
+            "the CUDA-only source build."
+        )
+    return resolved
 
 
 def _cache_key(element: dict[str, Any]) -> tuple[Any, ...]:
@@ -269,6 +288,8 @@ def register_system_pyav_video_reader() -> None:
     global _ORIGINAL_FETCH_VIDEO
 
     import qwen_vl_utils.vision_process as vision_process
+
+    _assert_software_video_decoders()
 
     if os.environ.get("FORCE_QWENVL_VIDEO_READER") not in (None, "torchvision"):
         raise RuntimeError(

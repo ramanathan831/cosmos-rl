@@ -1,5 +1,6 @@
 import pickle
 
+import pytest
 import torch
 
 from cosmos_rl.policy.config import SFTDataConfig
@@ -37,24 +38,27 @@ def test_zero_workers_do_not_apply_prefetch_or_context():
 def test_system_pyav_worker_initializer_is_spawned(monkeypatch):
     monkeypatch.setenv("COSMOS_DATALOADER_VIDEO_DECODER", "system_pyav")
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-A,GPU-B,GPU-C,GPU-D")
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_device",
+        lambda: pytest.fail("CPU System PyAV workers must not query a CUDA device"),
+    )
     kwargs = _dataloader_worker_kwargs(1, 1)
 
-    assert kwargs["worker_init_fn"].func is _initialize_dataloader_worker
-    assert kwargs["worker_init_fn"].keywords == {"decoder_device_index": 3}
+    assert kwargs["worker_init_fn"] is _initialize_dataloader_worker
     loader = torch.utils.data.DataLoader(
         _VideoReaderRegistrationDataset(), batch_size=1, **kwargs
     )
     module, visible_device = next(iter(loader))
-    assert module == ["cosmos_rl.utils.system_pyav_video_reader"]
-    assert visible_device == ["GPU-D"]
+    assert tuple(module) == ("cosmos_rl.utils.system_pyav_video_reader",)
+    assert tuple(visible_device) == ("GPU-A,GPU-B,GPU-C,GPU-D",)
 
 
-def test_system_pyav_worker_initializer_accepts_single_visible_device(monkeypatch):
+def test_system_pyav_worker_initializer_does_not_change_visible_devices(monkeypatch):
     monkeypatch.setenv("COSMOS_DATALOADER_VIDEO_DECODER", "system_pyav")
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-ONLY")
 
-    _initialize_dataloader_worker(0, decoder_device_index=7)
+    _initialize_dataloader_worker(0)
 
     assert __import__("os").environ["CUDA_VISIBLE_DEVICES"] == "GPU-ONLY"
 

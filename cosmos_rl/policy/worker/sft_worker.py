@@ -19,7 +19,6 @@ import json
 import os
 import atexit
 import traceback as _tb
-from functools import partial
 import torch
 from typing import Optional, Union, Callable, Dict, Any
 from torch.utils.data import Dataset
@@ -59,16 +58,12 @@ def _is_pp_enabled(parallel_dims) -> bool:
     return bool(getattr(parallel_dims, "pp_enabled", False))
 
 
-def _initialize_dataloader_worker(
-    worker_id: int, decoder_device_index: Optional[int] = None
-) -> None:
+def _initialize_dataloader_worker(worker_id: int) -> None:
     """Restore process-local video hooks after a spawn-based worker start.
 
-    System FFmpeg maps the H.264/H.265 codecs to NVDEC.  Each policy rank
-    therefore constrains its spawned video worker to the CUDA device already
-    selected by that rank.  Without this isolation, independently spawned
-    workers can all create decoder contexts on visible device zero and the
-    FFmpeg/CUDA stack can segfault under concurrent full-scale loading.
+    The DAFT ``cpu``/``torchvision`` contract uses the official PyAV wheel's
+    software H.264/H.265 decoders.  No CUDA context may be created in these
+    workers; the reader enforces that contract again during registration.
     """
     video_decoder = os.environ.get("COSMOS_DATALOADER_VIDEO_DECODER")
     if video_decoder is None:
@@ -79,38 +74,14 @@ def _initialize_dataloader_worker(
             f"{video_decoder}"
         )
 
-    selected_device = None
-    if decoder_device_index is not None:
-        visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
-        if visible_devices:
-            device_tokens = [
-                token.strip()
-                for token in visible_devices.split(",")
-                if token.strip()
-            ]
-            if len(device_tokens) == 1:
-                selected_device = device_tokens[0]
-            elif 0 <= decoder_device_index < len(device_tokens):
-                selected_device = device_tokens[decoder_device_index]
-            else:
-                raise RuntimeError(
-                    "decoder device index is outside CUDA_VISIBLE_DEVICES: "
-                    f"index={decoder_device_index}, count={len(device_tokens)}"
-                )
-        else:
-            selected_device = str(decoder_device_index)
-        os.environ["CUDA_VISIBLE_DEVICES"] = selected_device
-
     from cosmos_rl.utils.system_pyav_video_reader import (
         register_system_pyav_video_reader,
     )
 
     register_system_pyav_video_reader()
     logger.info(
-        "DataLoader worker %s registered System PyAV video decoder "
-        "with CUDA_VISIBLE_DEVICES=%s",
+        "DataLoader worker %s registered software System PyAV video decoder",
         worker_id,
-        selected_device,
     )
 
 
@@ -128,10 +99,7 @@ def _dataloader_worker_kwargs(
     if num_workers > 0:
         kwargs["multiprocessing_context"] = "spawn"
         if os.environ.get("COSMOS_DATALOADER_VIDEO_DECODER") is not None:
-            kwargs["worker_init_fn"] = partial(
-                _initialize_dataloader_worker,
-                decoder_device_index=torch.cuda.current_device(),
-            )
+            kwargs["worker_init_fn"] = _initialize_dataloader_worker
         if prefetch_factor is not None:
             kwargs["prefetch_factor"] = prefetch_factor
     return kwargs

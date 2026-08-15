@@ -35,6 +35,16 @@ def test_registration_replaces_qwen_torchvision_backend(monkeypatch):
     assert vision_process.fetch_video is reader.fetch_video_system_pyav_cached
 
 
+def test_registration_rejects_cuda_codec_aliases(monkeypatch):
+    class FakeCodec:
+        def __init__(self, name, _mode):
+            self.name = f"{name}_cuvid"
+
+    monkeypatch.setattr(reader.av, "Codec", FakeCodec)
+    with pytest.raises(RuntimeError, match="requires software h264/hevc codecs"):
+        reader.register_system_pyav_video_reader()
+
+
 def test_tao_wts_hook_accepts_explicit_torchvision_contract(monkeypatch):
     from cosmos_rl.tools.custom_hooks.tao_sft_example import (
         CustomConfig,
