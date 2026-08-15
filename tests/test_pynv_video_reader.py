@@ -18,6 +18,7 @@ register_pynv_video_reader = pynv_video_reader.register_pynv_video_reader
 
 
 def _install_fake_runtime(monkeypatch, decoder_type):
+    monkeypatch.setenv("TAO_PYNV_FRAME_TRANSFER", "host_rgb")
     vision = SimpleNamespace(
         VIDEO_READER_BACKENDS={},
         FORCE_QWENVL_VIDEO_READER=None,
@@ -55,7 +56,7 @@ def _install_fake_runtime(monkeypatch, decoder_type):
         "PyNvVideoCodec",
         SimpleNamespace(
             SimpleDecoder=decoder_type,
-            OutputColorType=SimpleNamespace(RGB="rgb"),
+            OutputColorType=SimpleNamespace(RGB="rgb", RGBP="rgbp"),
             __version__="2.2.0",
         ),
     )
@@ -146,6 +147,8 @@ def test_gpu_reader_reuses_context_stream_and_decoder(tmp_path, monkeypatch, cap
         "backend": "pynvvideocodec",
         "version": "2.2.0",
         "cache_size": 0,
+        "decoder_cache_size": 1,
+        "frame_transfer": "host_rgb",
         "cache_boundary": "processed_fetch_video",
         "video_overrides": 1,
         "strict": True,
@@ -171,6 +174,8 @@ def test_gpu_reader_exports_spawn_worker_contract(tmp_path, monkeypatch):
     assert pynv_video_reader.os.environ["FORCE_QWENVL_VIDEO_READER"] == "pynvvideocodec"
     assert pynv_video_reader.os.environ["TAO_PYNV_VIDEO_STRICT"] == "1"
     assert pynv_video_reader.os.environ["TAO_PYNV_VIDEO_CACHE_SIZE"] == "4"
+    assert pynv_video_reader.os.environ["TAO_PYNV_DECODER_CACHE_SIZE"] == "1"
+    assert pynv_video_reader.os.environ["TAO_PYNV_FRAME_TRANSFER"] == "host_rgb"
     with pytest.raises(RuntimeError, match="CPU video decoding fallback"):
         vision.VIDEO_READER_BACKENDS["torchvision"]({"video": str(video)})
 
@@ -232,3 +237,79 @@ def test_gpu_reader_rescans_overstated_container_frame_count(
     assert "unscanned_total_frames=301" in output
     assert "TAO_GPU_VIDEO_BATCH_RECOVERED" in output
     assert "scanned_total_frames=275" in output
+
+
+def test_gpu_reader_device_rgbp_uses_dlpack_and_native_session_cache(
+    tmp_path, monkeypatch
+):
+    first_video = tmp_path / "first.mp4"
+    second_video = tmp_path / "second.mp4"
+    first_video.write_bytes(b"video")
+    second_video.write_bytes(b"video")
+    decoder_options = []
+    reconfigured = []
+
+    class Frame:
+        pass
+
+    class Decoder:
+        def __init__(self, _path, **kwargs):
+            decoder_options.append(kwargs)
+
+        def reconfigure_decoder(self, path):
+            reconfigured.append(str(path))
+
+        def get_stream_metadata(self):
+            return SimpleNamespace(average_fps=30.0)
+
+        def __len__(self):
+            return 8
+
+        def get_batch_frames_by_index(self, indices):
+            return [Frame() for _ in indices]
+
+        def stop(self):
+            return None
+
+    class DeviceTensor:
+        device = SimpleNamespace(type="cuda")
+        ndim = 3
+        shape = (3, 2, 2)
+
+    class DeviceBatch:
+        def cpu(self):
+            return torch.zeros((8, 3, 2, 2), dtype=torch.uint8)
+
+    vision = _install_fake_runtime(monkeypatch, Decoder)
+    monkeypatch.setenv("TAO_PYNV_FRAME_TRANSFER", "device_rgbp")
+    monkeypatch.setattr(torch, "from_dlpack", lambda _frame: DeviceTensor())
+    monkeypatch.setattr(torch, "stack", lambda _tensors: DeviceBatch())
+    synchronized = []
+    monkeypatch.setattr(torch.cuda, "synchronize", synchronized.append)
+
+    profile = register_pynv_video_reader(
+        cache_size=17,
+        decoder_cache_size=37,
+        strict=True,
+    )
+    reader = vision.VIDEO_READER_BACKENDS["pynvvideocodec"]
+    frames, _metadata, _sample_fps = reader(
+        {"video": str(first_video), "nframes": 8}
+    )
+    reader({"video": str(second_video), "nframes": 8})
+
+    assert tuple(frames.shape) == (8, 3, 2, 2)
+    assert len(decoder_options) == 1
+    assert decoder_options[0]["use_device_memory"] is True
+    assert decoder_options[0]["output_color_type"] == "rgbp"
+    assert decoder_options[0]["decoder_cache_size"] == 37
+    assert reconfigured == [str(second_video)]
+    assert synchronized == [0, 0]
+    assert profile["frame_transfer"] == "device_rgbp"
+    assert profile["decoder_cache_size"] == 37
+
+
+def test_gpu_reader_rejects_unknown_frame_transfer(monkeypatch):
+    monkeypatch.setenv("TAO_PYNV_FRAME_TRANSFER", "unknown")
+    with pytest.raises(ValueError, match="host_rgb or device_rgbp"):
+        register_pynv_video_reader(cache_size=0, strict=True)

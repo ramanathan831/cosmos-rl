@@ -19,6 +19,8 @@ import json
 import os
 import atexit
 import traceback as _tb
+from concurrent.futures import ThreadPoolExecutor
+
 import torch
 from typing import Optional, Union, Callable, Dict, Any
 from torch.utils.data import Dataset
@@ -133,6 +135,10 @@ class SFTDataset(Dataset):
         self.data_packer = data_packer
         self.is_user_dataset = is_user_dataset
         self.cache = None
+        self.batch_threads = int(os.environ.get("TAO_SFT_BATCH_THREADS", "1"))
+        if self.batch_threads < 1:
+            raise ValueError("TAO_SFT_BATCH_THREADS must be a positive integer")
+        self._batch_executor: Optional[ThreadPoolExecutor] = None
 
         # Determine if cache should be enabled
         should_enable_cache = (
@@ -211,6 +217,17 @@ class SFTDataset(Dataset):
 
     def __len__(self):
         return len(self.dataset)
+
+    def __getitems__(self, indices):
+        """Process one logical batch concurrently while preserving its order."""
+        if self.batch_threads == 1 or len(indices) < 2:
+            return [self[index] for index in indices]
+        if self._batch_executor is None:
+            self._batch_executor = ThreadPoolExecutor(
+                max_workers=min(self.batch_threads, len(indices)),
+                thread_name_prefix="tao-sft-batch",
+            )
+        return list(self._batch_executor.map(self.__getitem__, indices))
 
     def __getitem__(self, idx):
         # we only cache on_the_fly result

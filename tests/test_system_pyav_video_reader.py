@@ -82,6 +82,38 @@ def test_tao_wts_hook_rejects_implicit_torchvision_contract(monkeypatch):
         configure_video_decoder(config)
 
 
+def test_tao_wts_hook_forwards_explicit_pynv_cache_contract(monkeypatch):
+    from cosmos_rl.tools.custom_hooks import tao_sft_example as hook
+    from cosmos_rl.utils import pynv_video_reader
+
+    calls = []
+    monkeypatch.setenv("COSMOS_ROLE", "Policy")
+    monkeypatch.setattr(
+        pynv_video_reader,
+        "register_pynv_video_reader",
+        lambda **kwargs: calls.append(kwargs) or {"backend": "pynvvideocodec"},
+    )
+    config = hook.CustomConfig.model_validate(
+        {
+            "train_dataset": {"annotation_path": "/tmp/train.json"},
+            "video_decoder": "pynvvideocodec",
+            "video_cache_size": 341,
+            "video_decoder_cache_size": 341,
+        }
+    )
+
+    assert hook.configure_video_decoder(config) == {
+        "backend": "pynvvideocodec"
+    }
+    assert calls == [
+        {
+            "cache_size": 341,
+            "decoder_cache_size": 341,
+            "video_override_map": None,
+        }
+    ]
+
+
 def test_repeated_parallel_reads_are_single_flight(monkeypatch):
     reader.clear_video_cache()
     monkeypatch.setattr(reader, "_CACHE_MAX_ITEMS", 8)
