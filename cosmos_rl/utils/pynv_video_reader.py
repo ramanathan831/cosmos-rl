@@ -230,9 +230,11 @@ def register_pynv_video_reader(
                 # PyNvVideoCodec 2.2.0's native batch seek can transiently
                 # return fewer frames than requested even when every exact
                 # index decodes successfully. Preserve the same indices and
-                # remain strictly GPU-only by retrying each index in a fresh
-                # NVDEC decoder session. Never route through Qwen's CPU
-                # fallback.
+                # remain strictly GPU-only by retrying the complete batch in
+                # a fresh NVDEC decoder session. Recreating a decoder for each
+                # individual frame can crash PyNvVideoCodec 2.2.0 while its
+                # native decoder teardown is still in flight. Never route
+                # through Qwen's CPU fallback.
                 cuda_state.pop("decoder", None)
                 cuda_state.pop("decoder_path", None)
                 release_decoder(decoder)
@@ -243,29 +245,34 @@ def register_pynv_video_reader(
                     f"indices={indices} error={type(batch_error).__name__}",
                     flush=True,
                 )
-                arrays = []
-                for index in indices:
-                    last_error = None
-                    for _attempt in range(3):
-                        single_decoder = make_decoder(
-                            video_path, cuda_context, cuda_stream, gpu_id
-                        )
-                        try:
-                            arrays.append(
-                                copy_rgb_frame(single_decoder[index], video_path)
+                arrays = None
+                last_error = batch_error
+                for _attempt in range(3):
+                    retry_decoder = make_decoder(
+                        video_path, cuda_context, cuda_stream, gpu_id
+                    )
+                    try:
+                        retry_frames = retry_decoder.get_batch_frames_by_index(indices)
+                        if len(retry_frames) != len(indices):
+                            raise RuntimeError(
+                                "NVDEC retry batch returned "
+                                f"{len(retry_frames)} of {len(indices)} frames"
                             )
-                            last_error = None
-                            break
-                        except Exception as exc:
-                            last_error = exc
-                        finally:
-                            release_decoder(single_decoder)
-                            del single_decoder
-                    if last_error is not None:
-                        raise RuntimeError(
-                            "GPU-only PyNvVideoCodec retry failed for "
-                            f"{video_path} frame {index}"
-                        ) from last_error
+                        arrays = [
+                            copy_rgb_frame(frame, video_path) for frame in retry_frames
+                        ]
+                        last_error = None
+                        break
+                    except Exception as exc:
+                        last_error = exc
+                    finally:
+                        release_decoder(retry_decoder)
+                        del retry_decoder
+                if last_error is not None or arrays is None:
+                    raise RuntimeError(
+                        "GPU-only PyNvVideoCodec batch retry failed for "
+                        f"{video_path} indices {indices}"
+                    ) from last_error
             video = torch.from_numpy(np.stack(arrays)).permute(0, 3, 1, 2).contiguous()
             sample_fps = nframes / max(selected_total_frames, 1.0) * video_fps
             result = (
