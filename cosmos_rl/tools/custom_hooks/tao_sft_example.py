@@ -105,6 +105,7 @@ class CustomConfig(pydantic.BaseModel):
 
     video_decoder: pydantic.StrictStr = "pynvvideocodec"
     video_cache_size: int = pydantic.Field(default=2, ge=0)
+    video_decoder_cache_size: int = pydantic.Field(default=1, ge=1)
     video_override_map: str | None = None
 
     vision: VisionConfig = pydantic.Field(
@@ -127,6 +128,7 @@ def configure_video_decoder(custom_config: CustomConfig) -> dict[str, object]:
 
         return register_pynv_video_reader(
             cache_size=custom_config.video_cache_size,
+            decoder_cache_size=custom_config.video_decoder_cache_size,
             video_override_map=custom_config.video_override_map,
         )
     if custom_config.video_decoder == "torchvision":

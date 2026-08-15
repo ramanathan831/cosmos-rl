@@ -1,4 +1,5 @@
 import pickle
+import threading
 
 import pytest
 import torch
@@ -94,3 +95,30 @@ def test_disabled_dataset_cache_processes_samples_directly(monkeypatch):
     )
 
     assert dataset.cache is None
+
+
+def test_batched_getitems_parallelizes_and_preserves_order(monkeypatch):
+    barrier = threading.Barrier(4)
+    thread_ids = set()
+    lock = threading.Lock()
+
+    class Packer:
+        def sft_process_sample(self, sample):
+            with lock:
+                thread_ids.add(threading.get_ident())
+            barrier.wait(timeout=5)
+            return sample * 10
+
+    monkeypatch.setenv("TAO_SFT_BATCH_THREADS", "4")
+    config = SFTDataConfig(type="sft", enable_dataset_cache=False)
+    dataset = SFTDataset(
+        config,
+        dataset=[0, 1, 2, 3],
+        data_packer=Packer(),
+        is_user_dataset=True,
+        enable_cache=False,
+    )
+
+    assert dataset.__getitems__([3, 1, 2, 0]) == [30, 10, 20, 0]
+    assert len(thread_ids) == 4
+    dataset._batch_executor.shutdown(wait=True)
