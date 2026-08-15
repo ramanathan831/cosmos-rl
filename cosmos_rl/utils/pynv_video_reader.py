@@ -230,11 +230,11 @@ def register_pynv_video_reader(
                 # PyNvVideoCodec 2.2.0's native batch seek can transiently
                 # return fewer frames than requested even when every exact
                 # index decodes successfully. Preserve the same indices and
-                # remain strictly GPU-only by retrying the complete batch in
-                # a fresh NVDEC decoder session. Recreating a decoder for each
-                # individual frame can crash PyNvVideoCodec 2.2.0 while its
-                # native decoder teardown is still in flight. Never route
-                # through Qwen's CPU fallback.
+                # remain strictly GPU-only by reading every exact index from
+                # one fresh NVDEC decoder session. Retrying the native batch
+                # call can repeat the omission, while recreating a decoder for
+                # every individual frame can crash PyNvVideoCodec 2.2.0 during
+                # decoder teardown. Never route through Qwen's CPU fallback.
                 cuda_state.pop("decoder", None)
                 cuda_state.pop("decoder_path", None)
                 release_decoder(decoder)
@@ -252,14 +252,9 @@ def register_pynv_video_reader(
                         video_path, cuda_context, cuda_stream, gpu_id
                     )
                     try:
-                        retry_frames = retry_decoder.get_batch_frames_by_index(indices)
-                        if len(retry_frames) != len(indices):
-                            raise RuntimeError(
-                                "NVDEC retry batch returned "
-                                f"{len(retry_frames)} of {len(indices)} frames"
-                            )
                         arrays = [
-                            copy_rgb_frame(frame, video_path) for frame in retry_frames
+                            copy_rgb_frame(retry_decoder[index], video_path)
+                            for index in indices
                         ]
                         last_error = None
                         break
@@ -270,7 +265,7 @@ def register_pynv_video_reader(
                         del retry_decoder
                 if last_error is not None or arrays is None:
                     raise RuntimeError(
-                        "GPU-only PyNvVideoCodec batch retry failed for "
+                        "GPU-only PyNvVideoCodec indexed retry failed for "
                         f"{video_path} indices {indices}"
                     ) from last_error
             video = torch.from_numpy(np.stack(arrays)).permute(0, 3, 1, 2).contiguous()
