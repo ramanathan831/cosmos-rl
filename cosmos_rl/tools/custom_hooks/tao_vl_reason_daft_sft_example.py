@@ -43,7 +43,10 @@ import torch.utils.data
 from cosmos_rl.dispatcher.data.packer.base import BaseDataPacker
 from cosmos_rl.dispatcher.data.packer.hf_vlm_data_packer import HFVLMDataPacker
 from cosmos_rl.tools.custom_hooks import TAOStatusLogger
-from cosmos_rl.tools.custom_hooks.lifecycle_status import append_terminal_status
+from cosmos_rl.tools.custom_hooks.lifecycle_status import (
+    append_terminal_status,
+    is_lifecycle_status_owner,
+)
 from cosmos_rl.utils.logging import logger
 
 try:
@@ -226,11 +229,8 @@ def _get_results_dir() -> str | None:
 
 
 def _is_master_rank() -> bool:
-    cosmos_role = os.environ.get("COSMOS_ROLE", "")
-    node_rank = int(os.environ.get("NODE_RANK", 0))
-    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", 0)))
-    is_worker = cosmos_role != "Controller"
-    return is_worker and node_rank == 0 and local_rank == 0
+    """Check if this entrypoint process owns terminal lifecycle logging."""
+    return is_lifecycle_status_owner()
 
 
 def _write_fallback_status(status_file: str, status: str, message: str) -> None:

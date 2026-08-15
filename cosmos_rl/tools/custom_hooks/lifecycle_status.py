@@ -11,9 +11,25 @@ RUNNING record because of logger state inherited by the distributed worker.
 import json
 import os
 from datetime import datetime
+from typing import Mapping
 
 
 _TERMINAL_STATUSES = frozenset({"SUCCESS", "FAILURE"})
+
+
+def is_lifecycle_status_owner(environ: Mapping[str, str] | None = None) -> bool:
+    """Return whether this process owns the entrypoint terminal status.
+
+    Policy workers emit progress through ``TAOStatusLogger``. The controller
+    waits for those workers and is therefore the only process that can append a
+    terminal lifecycle record after the distributed run has actually ended.
+    Direct, role-less rank-zero execution uses the same ownership contract.
+    """
+    env = os.environ if environ is None else environ
+    role = env.get("COSMOS_ROLE", "")
+    node_rank = int(env.get("NODE_RANK", "0"))
+    local_rank = int(env.get("LOCAL_RANK", env.get("RANK", "0")))
+    return role in {"", "Controller"} and node_rank == 0 and local_rank == 0
 
 
 def append_terminal_status(filename: str, status: str, message: str) -> None:

@@ -6,8 +6,10 @@
 qwen-vl-utils' torchvision reader decodes every frame before selecting the
 requested samples. Long WTS clips repeat across multiple questions, which makes
 that behavior prohibitively expensive. This reader seeks to only the requested
-frames through the release image's source-built PyAV/system-FFmpeg stack and
-keeps a small, process-local single-flight cache for repeated clips.
+frames through the release image's checksum-pinned official PyAV wheel and
+keeps a small, process-local single-flight cache for repeated clips. The image
+build must prove that the ``h264`` and ``hevc`` descriptors resolve to software
+decoders; CUDA/CUVID resolution is rejected before dataset loading.
 """
 
 from __future__ import annotations
