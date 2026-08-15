@@ -173,3 +173,62 @@ def test_gpu_reader_exports_spawn_worker_contract(tmp_path, monkeypatch):
     assert pynv_video_reader.os.environ["TAO_PYNV_VIDEO_CACHE_SIZE"] == "4"
     with pytest.raises(RuntimeError, match="CPU video decoding fallback"):
         vision.VIDEO_READER_BACKENDS["torchvision"]({"video": str(video)})
+
+
+def test_gpu_reader_rescans_overstated_container_frame_count(
+    tmp_path, monkeypatch, capsys
+):
+    video = tmp_path / "overstated.mp4"
+    video.write_bytes(b"video")
+    decoder_options = []
+
+    class Frame:
+        shape = (2, 2, 3)
+        strides = (6, 3, 1)
+
+        def __init__(self):
+            self.value = np.zeros((2, 2, 3), dtype=np.uint8).ctypes
+
+        def framesize(self):
+            return 12
+
+        def GetPtrToPlane(self, _index):
+            return self.value.data
+
+    class Decoder:
+        def __init__(self, _path, **kwargs):
+            self.scanned = kwargs["need_scanned_stream_metadata"]
+            decoder_options.append(kwargs)
+
+        def get_stream_metadata(self):
+            return SimpleNamespace(average_fps=30.0)
+
+        def __len__(self):
+            return 275 if self.scanned else 301
+
+        def get_batch_frames_by_index(self, indices):
+            if not self.scanned:
+                raise IndexError("container metadata included undecodable tail frames")
+            assert indices == [0, 39, 78, 117, 157, 196, 235, 274]
+            return [Frame() for _ in indices]
+
+        def stop(self):
+            return None
+
+    vision = _install_fake_runtime(monkeypatch, Decoder)
+    register_pynv_video_reader(cache_size=0, strict=True)
+    reader = vision.VIDEO_READER_BACKENDS["pynvvideocodec"]
+
+    frames, metadata, _sample_fps = reader({"video": str(video), "nframes": 8})
+
+    assert [
+        option["need_scanned_stream_metadata"] for option in decoder_options
+    ] == [False, True]
+    assert tuple(frames.shape) == (8, 3, 2, 2)
+    assert metadata["frames_indices"] == [0, 39, 78, 117, 157, 196, 235, 274]
+    assert metadata["total_num_frames"] == 275
+    output = capsys.readouterr().out
+    assert "TAO_GPU_VIDEO_BATCH_RETRY" in output
+    assert "unscanned_total_frames=301" in output
+    assert "TAO_GPU_VIDEO_BATCH_RECOVERED" in output
+    assert "scanned_total_frames=275" in output
