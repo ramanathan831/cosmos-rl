@@ -68,6 +68,15 @@ def register_pynv_video_reader(
     cuda_state: dict[str, Any] = {}
     decode_attested = False
 
+    def release_decoder(decoder) -> None:
+        """Best-effort release across PyNvVideoCodec wrapper variants."""
+        try:
+            decoder.stop()
+        except AttributeError:
+            # PyNvVideoCodec 2.2.0's Python wrapper exposes ``stop`` even when
+            # the selected native SimpleDecoder implementation does not.
+            pass
+
     def cuda_check(result, operation):
         error, *values = result
         if int(error) != 0:
@@ -94,10 +103,7 @@ def register_pynv_video_reader(
         device = cuda_state.pop("device", None)
         cuda_state.pop("context", None)
         if decoder is not None:
-            try:
-                decoder.stop()
-            except Exception:
-                pass
+            release_decoder(decoder)
             del decoder
         if stream is not None:
             cuda_driver.cuStreamDestroy(stream)
@@ -148,6 +154,18 @@ def register_pynv_video_reader(
                 cuda_driver.cuCtxSetCurrent(cuda_state["context"]), "cuCtxSetCurrent"
             )
             decoder = cuda_state.get("decoder")
+            if decoder is not None and cuda_state["decoder_path"] != video_path:
+                # PyNvVideoCodec 2.2.0 can return fewer frames than requested
+                # after SimpleDecoder.reconfigure_decoder(), while its Python
+                # wrapper assumes a one-to-one result and raises IndexError.
+                # Keep the retained CUDA context/stream, but create a fresh
+                # decoder session for each source path. This remains NVDEC-only
+                # and preserves the exact requested uniform frame indices.
+                cuda_state.pop("decoder", None)
+                cuda_state.pop("decoder_path", None)
+                release_decoder(decoder)
+                del decoder
+                decoder = None
             if decoder is None:
                 decoder = nvc.SimpleDecoder(
                     video_path,
@@ -155,22 +173,13 @@ def register_pynv_video_reader(
                     cuda_context=cuda_context,
                     cuda_stream=cuda_stream,
                     use_device_memory=False,
-                    # Prepared override streams are deterministic H.264/MP4
-                    # artifacts whose header frame counts are validated against a
-                    # full metadata scan before use. Runtime decoding therefore
-                    # trusts container metadata for both source and override paths.
+                    # Runtime decoding trusts container metadata; source and
+                    # prepared override frame counts are validated separately.
                     need_scanned_stream_metadata=False,
-                    decoder_cache_size=4,
+                    decoder_cache_size=1,
                     output_color_type=nvc.OutputColorType.RGB,
                 )
                 cuda_state["decoder"] = decoder
-                cuda_state["decoder_path"] = video_path
-            elif cuda_state["decoder_path"] != video_path:
-                # Keep the package's native decoder/session cache alive across
-                # samples. Reconstructing SimpleDecoder per video makes libav
-                # repeatedly create and destroy CUDA contexts under spawned
-                # distributed data workers.
-                decoder.reconfigure_decoder(video_path)
                 cuda_state["decoder_path"] = video_path
 
             metadata = decoder.get_stream_metadata()
