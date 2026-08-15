@@ -137,6 +137,38 @@ def register_pynv_video_reader(
         atexit.register(cleanup_cuda_state)
         return int(context), int(stream), gpu_id
 
+    def make_decoder(
+        video_path: str,
+        cuda_context: int,
+        cuda_stream: int,
+        gpu_id: int,
+    ):
+        return nvc.SimpleDecoder(
+            video_path,
+            gpu_id=gpu_id,
+            cuda_context=cuda_context,
+            cuda_stream=cuda_stream,
+            use_device_memory=False,
+            # Runtime decoding trusts container metadata; source and
+            # prepared override frame counts are validated separately.
+            need_scanned_stream_metadata=False,
+            decoder_cache_size=1,
+            output_color_type=nvc.OutputColorType.RGB,
+        )
+
+    def copy_rgb_frame(frame, video_path: str):
+        shape = tuple(int(value) for value in frame.shape)
+        strides = tuple(int(value) for value in frame.strides)
+        if len(shape) != 3 or shape[2] != 3:
+            raise RuntimeError(f"unexpected RGB frame layout {shape} for {video_path}")
+        raw = np.ctypeslib.as_array(
+            ctypes.cast(frame.GetPtrToPlane(0), ctypes.POINTER(ctypes.c_uint8)),
+            shape=(int(frame.framesize()),),
+        )
+        return np.ndarray(
+            shape=shape, dtype=np.uint8, buffer=raw, strides=strides
+        ).copy()
+
     def read_video_pynv(element):
         nonlocal decode_attested
         with decoder_lock:
@@ -167,17 +199,8 @@ def register_pynv_video_reader(
                 del decoder
                 decoder = None
             if decoder is None:
-                decoder = nvc.SimpleDecoder(
-                    video_path,
-                    gpu_id=gpu_id,
-                    cuda_context=cuda_context,
-                    cuda_stream=cuda_stream,
-                    use_device_memory=False,
-                    # Runtime decoding trusts container metadata; source and
-                    # prepared override frame counts are validated separately.
-                    need_scanned_stream_metadata=False,
-                    decoder_cache_size=1,
-                    output_color_type=nvc.OutputColorType.RGB,
+                decoder = make_decoder(
+                    video_path, cuda_context, cuda_stream, gpu_id
                 )
                 cuda_state["decoder"] = decoder
                 cuda_state["decoder_path"] = video_path
@@ -196,23 +219,53 @@ def register_pynv_video_reader(
             indices = (
                 torch.linspace(start_frame, end_frame, nframes).round().long().tolist()
             )
-            arrays = []
-            for frame in decoder.get_batch_frames_by_index(indices):
-                shape = tuple(int(value) for value in frame.shape)
-                strides = tuple(int(value) for value in frame.strides)
-                if len(shape) != 3 or shape[2] != 3:
+            try:
+                batch_frames = decoder.get_batch_frames_by_index(indices)
+                if len(batch_frames) != len(indices):
                     raise RuntimeError(
-                        f"unexpected RGB frame layout {shape} for {video_path}"
+                        f"NVDEC batch returned {len(batch_frames)} of {len(indices)} frames"
                     )
-                raw = np.ctypeslib.as_array(
-                    ctypes.cast(frame.GetPtrToPlane(0), ctypes.POINTER(ctypes.c_uint8)),
-                    shape=(int(frame.framesize()),),
+                arrays = [copy_rgb_frame(frame, video_path) for frame in batch_frames]
+            except Exception as batch_error:
+                # PyNvVideoCodec 2.2.0's native batch seek can transiently
+                # return fewer frames than requested even when every exact
+                # index decodes successfully. Preserve the same indices and
+                # remain strictly GPU-only by retrying each index in a fresh
+                # NVDEC decoder session. Never route through Qwen's CPU
+                # fallback.
+                cuda_state.pop("decoder", None)
+                cuda_state.pop("decoder_path", None)
+                release_decoder(decoder)
+                del decoder
+                print(
+                    "TAO_GPU_VIDEO_BATCH_RETRY "
+                    f"backend=pynvvideocodec video={video_path} "
+                    f"indices={indices} error={type(batch_error).__name__}",
+                    flush=True,
                 )
-                arrays.append(
-                    np.ndarray(
-                        shape=shape, dtype=np.uint8, buffer=raw, strides=strides
-                    ).copy()
-                )
+                arrays = []
+                for index in indices:
+                    last_error = None
+                    for _attempt in range(3):
+                        single_decoder = make_decoder(
+                            video_path, cuda_context, cuda_stream, gpu_id
+                        )
+                        try:
+                            arrays.append(
+                                copy_rgb_frame(single_decoder[index], video_path)
+                            )
+                            last_error = None
+                            break
+                        except Exception as exc:
+                            last_error = exc
+                        finally:
+                            release_decoder(single_decoder)
+                            del single_decoder
+                    if last_error is not None:
+                        raise RuntimeError(
+                            "GPU-only PyNvVideoCodec retry failed for "
+                            f"{video_path} frame {index}"
+                        ) from last_error
             video = torch.from_numpy(np.stack(arrays)).permute(0, 3, 1, 2).contiguous()
             sample_fps = nframes / max(selected_total_frames, 1.0) * video_fps
             result = (
