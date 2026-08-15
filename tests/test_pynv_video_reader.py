@@ -27,6 +27,7 @@ def _install_fake_runtime(monkeypatch, decoder_type):
             total,
         ),
         smart_nframes=lambda _element, **_kwargs: 8,
+        fetch_video=lambda *_args, **_kwargs: None,
         get_video_reader_backend=SimpleNamespace(cache_clear=lambda: None),
     )
     driver = SimpleNamespace(
@@ -89,7 +90,7 @@ def test_gpu_reader_reuses_context_stream_and_decoder(tmp_path, monkeypatch, cap
             decoder_options.append(kwargs)
 
         def reconfigure_decoder(self, path):
-            decoder_paths.append(str(path))
+            raise AssertionError(f"decoder reuse across sources is forbidden: {path}")
 
         def get_stream_metadata(self):
             return SimpleNamespace(average_fps=30.0)
@@ -130,18 +131,22 @@ def test_gpu_reader_reuses_context_stream_and_decoder(tmp_path, monkeypatch, cap
     reader({"video": str(ordinary), "nframes": 8})
 
     assert decoder_paths == [str(target), str(ordinary)]
-    assert len(decoder_options) == 1
+    assert len(decoder_options) == 2
     assert decoder_options[0]["gpu_id"] == 0
     assert decoder_options[0]["cuda_context"] == 20
     assert decoder_options[0]["cuda_stream"] == 33
-    assert decoder_options[0]["decoder_cache_size"] == 4
-    assert decoder_options[0]["need_scanned_stream_metadata"] is False
+    assert all(option["decoder_cache_size"] == 1 for option in decoder_options)
+    assert all(
+        option["need_scanned_stream_metadata"] is False
+        for option in decoder_options
+    )
     assert tuple(first.shape) == (8, 3, 2, 2)
     assert metadata["video_backend"] == "pynvvideocodec"
     assert profile == {
         "backend": "pynvvideocodec",
         "version": "2.2.0",
         "cache_size": 0,
+        "cache_boundary": "processed_fetch_video",
         "video_overrides": 1,
         "strict": True,
     }
