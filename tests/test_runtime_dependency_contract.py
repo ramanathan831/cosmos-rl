@@ -126,14 +126,15 @@ def test_deepep_symbol_contract_reports_only_missing_symbols() -> None:
     assert missing_deepep_symbols(symbols) == ["internode_ll::query_mask_buffer"]
 
 
-def test_qwen_packer_normalizes_video_bounds_before_stale_fetch_reference() -> None:
+def test_qwen_packer_normalizes_video_bounds_before_dynamic_cached_fetch() -> None:
     source = PACKER.read_text(encoding="utf-8")
     function = source.split("def qwen_vl_process_vision_info(", 1)[1].split(
         "\ndef process_vision_info(", 1
     )[0]
 
     assert "normalize_video_pixel_bounds(" in function
-    assert "vision_process" in function
+    assert "vision_process.fetch_video(" in function
     assert function.index("normalize_video_pixel_bounds(") < function.index(
-        "fetch_video("
+        "vision_process.fetch_video("
     )
+    assert "from qwen_vl_utils import fetch_image, fetch_video" not in source
