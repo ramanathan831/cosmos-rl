@@ -45,7 +45,7 @@ def test_registration_rejects_cuda_codec_aliases(monkeypatch):
         reader.register_system_pyav_video_reader()
 
 
-def test_tao_wts_hook_accepts_explicit_torchvision_contract(monkeypatch):
+def test_video_conversation_hook_accepts_explicit_torchvision_contract(monkeypatch):
     from cosmos_rl.tools.custom_hooks.tao_sft_example import (
         CustomConfig,
         configure_video_decoder,
@@ -65,7 +65,7 @@ def test_tao_wts_hook_accepts_explicit_torchvision_contract(monkeypatch):
     assert reader.os.environ["COSMOS_DATALOADER_VIDEO_DECODER"] == "system_pyav"
 
 
-def test_tao_wts_hook_rejects_implicit_torchvision_contract(monkeypatch):
+def test_video_conversation_hook_rejects_implicit_torchvision_contract(monkeypatch):
     from cosmos_rl.tools.custom_hooks.tao_sft_example import (
         CustomConfig,
         configure_video_decoder,
@@ -82,7 +82,7 @@ def test_tao_wts_hook_rejects_implicit_torchvision_contract(monkeypatch):
         configure_video_decoder(config)
 
 
-def test_tao_wts_hook_forwards_explicit_pynv_cache_contract(monkeypatch):
+def test_video_conversation_hook_forwards_explicit_pynv_cache_contract(monkeypatch):
     from cosmos_rl.tools.custom_hooks import tao_sft_example as hook
     from cosmos_rl.utils import pynv_video_reader
 
@@ -114,7 +114,7 @@ def test_tao_wts_hook_forwards_explicit_pynv_cache_contract(monkeypatch):
     ]
 
 
-def test_tao_wts_hook_defaults_to_validated_pynv_cache_profile() -> None:
+def test_video_conversation_hook_defaults_to_validated_pynv_cache_profile() -> None:
     from cosmos_rl.tools.custom_hooks import tao_sft_example as hook
 
     config = hook.CustomConfig.model_validate(

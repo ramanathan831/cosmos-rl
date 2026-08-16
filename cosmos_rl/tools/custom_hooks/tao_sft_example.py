@@ -104,9 +104,9 @@ class CustomConfig(pydantic.BaseModel):
     """System prompt."""
 
     video_decoder: pydantic.StrictStr = "pynvvideocodec"
-    # The validated WTS throughput profile avoids retaining processed frame
-    # tensors while keeping a small native decoder-session LRU. Both caches
-    # still populate only on demand during ordinary training.
+    # The validated hardware-video throughput profile avoids retaining
+    # processed frame tensors while keeping a small native decoder-session LRU.
+    # Both caches populate only on demand during ordinary training.
     video_cache_size: int = pydantic.Field(default=0, ge=0)
     video_decoder_cache_size: int = pydantic.Field(default=4, ge=1)
     video_override_map: str | None = None
@@ -121,7 +121,7 @@ class CustomConfig(pydantic.BaseModel):
 
 
 def configure_video_decoder(custom_config: CustomConfig) -> dict[str, object]:
-    """Activate the decoder explicitly selected by the TAO WTS contract."""
+    """Activate the decoder selected by the TAO video-conversation contract."""
     if (
         custom_config.video_decoder == "pynvvideocodec"
         and os.environ.get("COSMOS_ROLE") != "Controller"
