@@ -69,6 +69,32 @@ def _install_fake_runtime(monkeypatch, decoder_type):
     monkeypatch.setitem(sys.modules, "cuda", cuda_module)
     monkeypatch.setitem(sys.modules, "cuda.bindings", bindings_module)
     monkeypatch.setitem(sys.modules, "torch", torch)
+    vision.software_reads = []
+
+    def read_video_system_pyav(element):
+        vision.software_reads.append(str(element["video"]))
+        return (
+            torch.zeros((8, 3, 2, 2), dtype=torch.uint8),
+            {
+                "fps": 30.0,
+                "frames_indices": list(range(8)),
+                "total_num_frames": 8,
+                "video_backend": "tao_system_pyav_sparse",
+            },
+            30.0,
+        )
+
+    software_reader = ModuleType("cosmos_rl.utils.system_pyav_video_reader")
+    software_reader._assert_software_video_decoders = lambda: {
+        "h264": "h264",
+        "hevc": "hevc",
+    }
+    software_reader.read_video_system_pyav = read_video_system_pyav
+    monkeypatch.setitem(
+        sys.modules,
+        "cosmos_rl.utils.system_pyav_video_reader",
+        software_reader,
+    )
     return vision
 
 
@@ -150,6 +176,8 @@ def test_gpu_reader_reuses_context_stream_and_decoder(tmp_path, monkeypatch, cap
         "decoder_cache_size": 1,
         "frame_transfer": "host_rgb",
         "cache_boundary": "processed_fetch_video",
+        "capability_fallback": "tao_system_pyav_sparse",
+        "capability_fallback_scope": "nvdec_unsupported_stream_only",
         "video_overrides": 1,
         "strict": True,
     }
@@ -307,6 +335,56 @@ def test_gpu_reader_device_rgbp_uses_dlpack_and_native_session_cache(
     assert synchronized == [0, 0]
     assert profile["frame_transfer"] == "device_rgbp"
     assert profile["decoder_cache_size"] == 37
+
+
+def test_gpu_reader_falls_back_only_for_nvdec_capability_errors(
+    tmp_path, monkeypatch, capsys
+):
+    unsupported = tmp_path / "unsupported.mp4"
+    unsupported.write_bytes(b"video")
+    decoder_calls = []
+
+    class PyNvVCExceptionUnsupported(Exception):
+        pass
+
+    PyNvVCExceptionUnsupported.__module__ = "_PyNvVideoCodec"
+
+    class Decoder:
+        def __init__(self, path, **_kwargs):
+            decoder_calls.append(str(path))
+
+        def get_stream_metadata(self):
+            return SimpleNamespace(average_fps=30.0)
+
+        def __len__(self):
+            return 8
+
+        def get_batch_frames_by_index(self, _indices):
+            raise PyNvVCExceptionUnsupported(
+                "Error code : 801; MBCount not supported on this GPU"
+            )
+
+        def stop(self):
+            return None
+
+    vision = _install_fake_runtime(monkeypatch, Decoder)
+    profile = register_pynv_video_reader(cache_size=0, strict=True)
+    reader = vision.VIDEO_READER_BACKENDS["pynvvideocodec"]
+
+    first, metadata, _sample_fps = reader(
+        {"video": str(unsupported), "nframes": 8}
+    )
+    second, _, _ = reader({"video": str(unsupported), "nframes": 8})
+
+    assert tuple(first.shape) == tuple(second.shape) == (8, 3, 2, 2)
+    assert metadata["video_backend"] == "tao_system_pyav_sparse"
+    assert decoder_calls == [str(unsupported)]
+    assert vision.software_reads == [str(unsupported), str(unsupported)]
+    assert profile["capability_fallback_scope"] == "nvdec_unsupported_stream_only"
+    output = capsys.readouterr().out
+    assert output.count("TAO_VIDEO_DECODER_CAPABILITY_FALLBACK_ATTESTATION") == 1
+    assert "reason=PyNvVCExceptionUnsupported" in output
+    assert "reason=cached_capability" in output
 
 
 def test_gpu_reader_rejects_unknown_frame_transfer(monkeypatch):
