@@ -4,8 +4,8 @@
 """Sparse, cached Qwen video reader for the release image's CPU PyAV stack.
 
 qwen-vl-utils' torchvision reader decodes every frame before selecting the
-requested samples. Long WTS clips repeat across multiple questions, which makes
-that behavior prohibitively expensive. This reader seeks to only the requested
+requested samples. Long clips can repeat across multiple conversations, which
+makes that behavior prohibitively expensive. This reader seeks only the requested
 frames through the release image's checksum-pinned official PyAV wheel and
 keeps a small, process-local single-flight cache for repeated clips. The image
 build must prove that the ``h264`` and ``hevc`` descriptors resolve to software
@@ -234,9 +234,10 @@ def fetch_video_system_pyav_cached(
 ) -> Any:
     """Cache qwen-vl-utils' fully resized video result with single-flight reads.
 
-    WTS contains many questions for each clip. Caching only the decoded uint8
-    frames still makes every question repeat the expensive bicubic resize and
-    float conversion. This wrapper moves the cache boundary past that work.
+    Video-conversation data can contain many prompts for each clip. Caching only
+    the decoded uint8 frames still makes every prompt repeat the expensive
+    bicubic resize and float conversion. This wrapper moves the cache boundary
+    past that work.
     """
     if _ORIGINAL_FETCH_VIDEO is None:
         raise RuntimeError("system PyAV video reader has not been registered")
