@@ -100,6 +100,7 @@ def _dataloader_worker_kwargs(
     kwargs: Dict[str, Any] = {"num_workers": num_workers}
     if num_workers > 0:
         kwargs["multiprocessing_context"] = "spawn"
+        kwargs["persistent_workers"] = True
         if os.environ.get("COSMOS_DATALOADER_VIDEO_DECODER") is not None:
             kwargs["worker_init_fn"] = _initialize_dataloader_worker
         if prefetch_factor is not None:

@@ -28,6 +28,7 @@ def test_nonzero_workers_use_spawn_and_prefetch():
     assert _dataloader_worker_kwargs(1, 1) == {
         "num_workers": 1,
         "multiprocessing_context": "spawn",
+        "persistent_workers": True,
         "prefetch_factor": 1,
     }
 
