@@ -18,7 +18,7 @@ from typing import Any
 def register_pynv_video_reader(
     *,
     cache_size: int = 0,
-    decoder_cache_size: int = 1,
+    decoder_cache_size: int = 4,
     video_override_map: str | None = None,
     strict: bool = True,
 ) -> dict[str, Any]:

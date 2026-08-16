@@ -136,7 +136,7 @@ def test_gpu_reader_reuses_context_stream_and_decoder(tmp_path, monkeypatch, cap
     assert decoder_options[0]["gpu_id"] == 0
     assert decoder_options[0]["cuda_context"] == 20
     assert decoder_options[0]["cuda_stream"] == 33
-    assert all(option["decoder_cache_size"] == 1 for option in decoder_options)
+    assert all(option["decoder_cache_size"] == 4 for option in decoder_options)
     assert all(
         option["need_scanned_stream_metadata"] is False
         for option in decoder_options
@@ -147,7 +147,7 @@ def test_gpu_reader_reuses_context_stream_and_decoder(tmp_path, monkeypatch, cap
         "backend": "pynvvideocodec",
         "version": "2.2.0",
         "cache_size": 0,
-        "decoder_cache_size": 1,
+        "decoder_cache_size": 4,
         "frame_transfer": "host_rgb",
         "cache_boundary": "processed_fetch_video",
         "video_overrides": 1,
@@ -174,7 +174,7 @@ def test_gpu_reader_exports_spawn_worker_contract(tmp_path, monkeypatch):
     assert pynv_video_reader.os.environ["FORCE_QWENVL_VIDEO_READER"] == "pynvvideocodec"
     assert pynv_video_reader.os.environ["TAO_PYNV_VIDEO_STRICT"] == "1"
     assert pynv_video_reader.os.environ["TAO_PYNV_VIDEO_CACHE_SIZE"] == "4"
-    assert pynv_video_reader.os.environ["TAO_PYNV_DECODER_CACHE_SIZE"] == "1"
+    assert pynv_video_reader.os.environ["TAO_PYNV_DECODER_CACHE_SIZE"] == "4"
     assert pynv_video_reader.os.environ["TAO_PYNV_FRAME_TRANSFER"] == "host_rgb"
     with pytest.raises(RuntimeError, match="CPU video decoding fallback"):
         vision.VIDEO_READER_BACKENDS["torchvision"]({"video": str(video)})

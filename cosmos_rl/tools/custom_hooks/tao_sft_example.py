@@ -104,8 +104,11 @@ class CustomConfig(pydantic.BaseModel):
     """System prompt."""
 
     video_decoder: pydantic.StrictStr = "pynvvideocodec"
-    video_cache_size: int = pydantic.Field(default=2, ge=0)
-    video_decoder_cache_size: int = pydantic.Field(default=1, ge=1)
+    # The validated WTS throughput profile avoids retaining processed frame
+    # tensors while keeping a small native decoder-session LRU. Both caches
+    # still populate only on demand during ordinary training.
+    video_cache_size: int = pydantic.Field(default=0, ge=0)
+    video_decoder_cache_size: int = pydantic.Field(default=4, ge=1)
     video_override_map: str | None = None
 
     vision: VisionConfig = pydantic.Field(
