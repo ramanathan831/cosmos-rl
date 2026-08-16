@@ -68,7 +68,7 @@ def test_repair_qwen_pynv_worker_source_is_idempotent() -> None:
     assert changed
     assert "def _ensure_forced_video_reader(" in repaired
     assert "_ensure_forced_video_reader(video_reader_backend)" in repaired
-    assert 'os.getenv("TAO_PYNV_DECODER_CACHE_SIZE", "1")' in repaired
+    assert 'os.getenv("TAO_PYNV_DECODER_CACHE_SIZE", "4")' in repaired
     assert "strict GPU video decoding failed; CPU fallback is disabled" in repaired
     assert repair_qwen_pynv_worker_source(repaired) == (repaired, False)
 
@@ -81,7 +81,7 @@ def test_repair_qwen_pynv_worker_source_rejects_unknown_source() -> None:
 def test_repair_qwen_pynv_worker_source_rejects_stale_worker_contract() -> None:
     repaired, _ = repair_qwen_pynv_worker_source(QWEN_SOURCE)
     stale = repaired.replace(
-        '        decoder_cache_size=int(os.getenv("TAO_PYNV_DECODER_CACHE_SIZE", "1")),\n',
+        '        decoder_cache_size=int(os.getenv("TAO_PYNV_DECODER_CACHE_SIZE", "4")),\n',
         "",
     )
     with pytest.raises(RuntimeError, match="Unrecognized qwen-vl-utils"):

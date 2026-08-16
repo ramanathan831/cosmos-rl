@@ -49,7 +49,7 @@ def _ensure_forced_video_reader(video_reader_backend: str) -> None:
 
     register_pynv_video_reader(
         cache_size=int(os.getenv("TAO_PYNV_VIDEO_CACHE_SIZE", "0")),
-        decoder_cache_size=int(os.getenv("TAO_PYNV_DECODER_CACHE_SIZE", "1")),
+        decoder_cache_size=int(os.getenv("TAO_PYNV_DECODER_CACHE_SIZE", "4")),
         video_override_map=os.getenv("TAO_PYNV_VIDEO_OVERRIDE_MAP") or None,
         strict=_env_flag("TAO_PYNV_VIDEO_STRICT", True),
     )
@@ -130,7 +130,7 @@ def repair_qwen_pynv_worker_source(source: str) -> tuple[str, bool]:
     markers = (
         "def _ensure_forced_video_reader(",
         "_ensure_forced_video_reader(video_reader_backend)",
-        'os.getenv("TAO_PYNV_DECODER_CACHE_SIZE", "1")',
+        'os.getenv("TAO_PYNV_DECODER_CACHE_SIZE", "4")',
         "strict GPU video decoding failed; CPU fallback is disabled",
     )
     if all(marker in source for marker in markers):
@@ -179,7 +179,7 @@ def verify_qwen_pynv_worker() -> None:
     required = (
         "def _ensure_forced_video_reader(",
         "_ensure_forced_video_reader(video_reader_backend)",
-        'os.getenv("TAO_PYNV_DECODER_CACHE_SIZE", "1")',
+        'os.getenv("TAO_PYNV_DECODER_CACHE_SIZE", "4")',
         "strict GPU video decoding failed; CPU fallback is disabled",
     )
     missing = [marker for marker in required if marker not in source]

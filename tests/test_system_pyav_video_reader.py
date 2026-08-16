@@ -114,6 +114,17 @@ def test_tao_wts_hook_forwards_explicit_pynv_cache_contract(monkeypatch):
     ]
 
 
+def test_tao_wts_hook_defaults_to_validated_pynv_cache_profile() -> None:
+    from cosmos_rl.tools.custom_hooks import tao_sft_example as hook
+
+    config = hook.CustomConfig.model_validate(
+        {"train_dataset": {"annotation_path": "/tmp/train.json"}}
+    )
+
+    assert config.video_cache_size == 0
+    assert config.video_decoder_cache_size == 4
+
+
 def test_repeated_parallel_reads_are_single_flight(monkeypatch):
     reader.clear_video_cache()
     monkeypatch.setattr(reader, "_CACHE_MAX_ITEMS", 8)
