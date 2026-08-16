@@ -36,6 +36,7 @@ from cosmos_rl.utils.util import retry
 from cosmos_rl.policy.config import Config
 from cosmos_rl.dispatcher.data.schema import ChatMessage
 from cosmos_rl.dispatcher.data.packer.base import DataPacker
+from cosmos_rl.utils.video_pixel_bounds import normalize_video_pixel_bounds
 
 from qwen_vl_utils import fetch_image, fetch_video
 import qwen_vl_utils.vision_process as vision_process
@@ -133,6 +134,11 @@ def qwen_vl_process_vision_info(
                 fetch_image(vision_info, image_patch_size=image_patch_size)
             )
         elif "video" in vision_info:
+            normalize_video_pixel_bounds(
+                vision_info,
+                image_patch_size,
+                vision_process,
+            )
             video_input, video_sample_fps = fetch_video(
                 vision_info,
                 return_video_sample_fps=True,
