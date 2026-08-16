@@ -17,6 +17,20 @@ from typing import Any
 from cosmos_rl.utils.video_pixel_bounds import normalize_video_pixel_bounds
 
 
+def _is_pynv_exception(error: BaseException) -> bool:
+    """Return whether an exception originated in PyNvVideoCodec native code."""
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if any(
+            "pynvvc" in cls.__name__.lower() for cls in type(current).__mro__
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 def _is_nvdec_capability_error(error: BaseException) -> bool:
     """Return whether an exception reports a permanent GPU-reader limitation.
 
@@ -388,7 +402,20 @@ def register_pynv_video_reader(
                     .tolist()
                 )
                 try:
-                    batch_frames = decoder.get_batch_frames_by_index(indices)
+                    try:
+                        batch_frames = decoder.get_batch_frames_by_index(indices)
+                    except Exception as batch_error:
+                        # At this boundary, a native PyNv exception means the
+                        # stream cannot satisfy random-access batch retrieval.
+                        # Route only that stream through the existing sparse
+                        # software reader. Other exception types retain the
+                        # scanned NVDEC recovery path below.
+                        if _is_pynv_exception(batch_error):
+                            discard_active_decoder()
+                            return read_video_capability_fallback(
+                                element, video_path, batch_error
+                            )
+                        raise
                     if len(batch_frames) != len(indices):
                         raise RuntimeError(
                             f"NVDEC batch returned {len(batch_frames)} of {len(indices)} frames"
