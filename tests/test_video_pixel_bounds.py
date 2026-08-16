@@ -32,6 +32,18 @@ def test_missing_minimum_is_normalized_on_the_reader_input_object() -> None:
     assert source["min_pixels"] == source["max_pixels"]
 
 
+def test_string_pixel_bounds_are_canonicalized_on_the_reader_input_object() -> None:
+    source = {"video": "clip.mp4", "max_pixels": "81920"}
+
+    normalized = normalize_video_pixel_bounds(source, 16, RUNTIME)
+
+    assert normalized is source
+    assert normalized["min_pixels"] == 81920
+    assert normalized["max_pixels"] == 81920
+    assert isinstance(normalized["min_pixels"], int)
+    assert isinstance(normalized["max_pixels"], int)
+
+
 def test_runtime_default_is_preserved_when_it_fits_explicit_maximum() -> None:
     source = {"video": "clip.mp4", "max_pixels": 262144}
     assert normalize_video_pixel_bounds(source, 16, RUNTIME) is source
