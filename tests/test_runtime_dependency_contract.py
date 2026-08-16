@@ -47,6 +47,10 @@ def get_video_reader_backend() -> str:
         except Exception as e:
             logger.warning(f"video_reader_backend {video_reader_backend} error, use torchvision as default, msg: {e}")
             video, video_metadata, sample_fps = VIDEO_READER_BACKENDS["torchvision"](ele)
+
+def fetch_video(ele: Dict[str, Any], image_patch_size: int = 14, return_video_sample_fps: bool = False,
+                return_video_metadata: bool = False) -> Union[torch.Tensor, List[Image.Image]]:
+    image_factor = image_patch_size * SPATIAL_MERGE_SIZE
 """
 
 
@@ -70,7 +74,23 @@ def test_repair_qwen_pynv_worker_source_is_idempotent() -> None:
     assert "_ensure_forced_video_reader(video_reader_backend)" in repaired
     assert 'os.getenv("TAO_PYNV_DECODER_CACHE_SIZE", "4")' in repaired
     assert "strict GPU video decoding failed; CPU fallback is disabled" in repaired
+    assert "normalize_video_pixel_bounds(ele, image_patch_size" in repaired
+    assert "sys.modules[__name__]" in repaired
     assert repair_qwen_pynv_worker_source(repaired) == (repaired, False)
+
+
+def test_repair_qwen_pynv_worker_source_upgrades_existing_worker_contract() -> None:
+    repaired, _ = repair_qwen_pynv_worker_source(QWEN_SOURCE)
+    worker_only = repaired.replace(
+        '    if os.getenv("FORCE_QWENVL_VIDEO_READER", FORCE_QWENVL_VIDEO_READER) == "pynvvideocodec":\n'
+        "        from cosmos_rl.utils.video_pixel_bounds import normalize_video_pixel_bounds\n\n"
+        "        normalize_video_pixel_bounds(ele, image_patch_size, sys.modules[__name__])\n",
+        "",
+    )
+    upgraded, changed = repair_qwen_pynv_worker_source(worker_only)
+    assert changed
+    assert "normalize_video_pixel_bounds(ele, image_patch_size" in upgraded
+    assert repair_qwen_pynv_worker_source(upgraded) == (upgraded, False)
 
 
 def test_repair_qwen_pynv_worker_source_rejects_unknown_source() -> None:

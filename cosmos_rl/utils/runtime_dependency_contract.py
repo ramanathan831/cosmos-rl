@@ -102,6 +102,18 @@ _QWEN_NEW_FALLBACK = """        except Exception as e:
             logger.warning(f"video_reader_backend {video_reader_backend} error, use torchvision as default, msg: {e}")
             video, video_metadata, sample_fps = VIDEO_READER_BACKENDS["torchvision"](ele)
 """
+_QWEN_FETCH_ANCHOR = """def fetch_video(ele: Dict[str, Any], image_patch_size: int = 14, return_video_sample_fps: bool = False,
+                return_video_metadata: bool = False) -> Union[torch.Tensor, List[Image.Image]]:
+    image_factor = image_patch_size * SPATIAL_MERGE_SIZE
+"""
+_QWEN_FETCH_WITH_PIXEL_NORMALIZATION = """def fetch_video(ele: Dict[str, Any], image_patch_size: int = 14, return_video_sample_fps: bool = False,
+                return_video_metadata: bool = False) -> Union[torch.Tensor, List[Image.Image]]:
+    if os.getenv("FORCE_QWENVL_VIDEO_READER", FORCE_QWENVL_VIDEO_READER) == "pynvvideocodec":
+        from cosmos_rl.utils.video_pixel_bounds import normalize_video_pixel_bounds
+
+        normalize_video_pixel_bounds(ele, image_patch_size, sys.modules[__name__])
+    image_factor = image_patch_size * SPATIAL_MERGE_SIZE
+"""
 
 
 def repair_vllm_conv3d_source(source: str) -> tuple[str, bool]:
@@ -127,29 +139,56 @@ def missing_deepep_symbols(symbols: str) -> list[str]:
 
 def repair_qwen_pynv_worker_source(source: str) -> tuple[str, bool]:
     """Install strict PyNvVideoCodec registration in qwen-vl-utils 0.0.14."""
-    markers = (
+    worker_markers = (
         "def _ensure_forced_video_reader(",
         "_ensure_forced_video_reader(video_reader_backend)",
         'os.getenv("TAO_PYNV_DECODER_CACHE_SIZE", "4")',
         "strict GPU video decoding failed; CPU fallback is disabled",
     )
-    if all(marker in source for marker in markers):
+    pixel_markers = (
+        "from cosmos_rl.utils.video_pixel_bounds import normalize_video_pixel_bounds",
+        "normalize_video_pixel_bounds(ele, image_patch_size, sys.modules[__name__])",
+    )
+    worker_markers_present = tuple(marker in source for marker in worker_markers)
+    pixel_markers_present = tuple(marker in source for marker in pixel_markers)
+    if all(worker_markers_present) and all(pixel_markers_present):
         normalized = source if source.endswith("\n") else source + "\n"
         return normalized, normalized != source
-    if (
-        source.count(_QWEN_FORCE_ANCHOR) != 1
-        or source.count(_QWEN_OLD_BACKEND) != 1
-        or source.count(_QWEN_OLD_FALLBACK) != 1
-    ):
+    if any(worker_markers_present) and not all(worker_markers_present):
         raise RuntimeError(
             "Unrecognized qwen-vl-utils video implementation; refusing blind patch"
         )
-    repaired = source.replace(
-        _QWEN_FORCE_ANCHOR,
-        _QWEN_FORCE_ANCHOR + _QWEN_WORKER_HELPERS,
-    )
-    repaired = repaired.replace(_QWEN_OLD_BACKEND, _QWEN_NEW_BACKEND)
-    repaired = repaired.replace(_QWEN_OLD_FALLBACK, _QWEN_NEW_FALLBACK)
+    if any(pixel_markers_present) and not all(pixel_markers_present):
+        raise RuntimeError(
+            "Unrecognized qwen-vl-utils pixel-bound contract; refusing blind patch"
+        )
+
+    repaired = source
+    if not all(worker_markers_present):
+        if (
+            repaired.count(_QWEN_FORCE_ANCHOR) != 1
+            or repaired.count(_QWEN_OLD_BACKEND) != 1
+            or repaired.count(_QWEN_OLD_FALLBACK) != 1
+        ):
+            raise RuntimeError(
+                "Unrecognized qwen-vl-utils video implementation; refusing blind patch"
+            )
+        repaired = repaired.replace(
+            _QWEN_FORCE_ANCHOR,
+            _QWEN_FORCE_ANCHOR + _QWEN_WORKER_HELPERS,
+        )
+        repaired = repaired.replace(_QWEN_OLD_BACKEND, _QWEN_NEW_BACKEND)
+        repaired = repaired.replace(_QWEN_OLD_FALLBACK, _QWEN_NEW_FALLBACK)
+
+    if not all(pixel_markers_present):
+        if repaired.count(_QWEN_FETCH_ANCHOR) != 1:
+            raise RuntimeError(
+                "Unrecognized qwen-vl-utils fetch_video implementation; refusing blind patch"
+            )
+        repaired = repaired.replace(
+            _QWEN_FETCH_ANCHOR,
+            _QWEN_FETCH_WITH_PIXEL_NORMALIZATION,
+        )
     if not repaired.endswith("\n"):
         repaired += "\n"
     return repaired, True
@@ -181,6 +220,8 @@ def verify_qwen_pynv_worker() -> None:
         "_ensure_forced_video_reader(video_reader_backend)",
         'os.getenv("TAO_PYNV_DECODER_CACHE_SIZE", "4")',
         "strict GPU video decoding failed; CPU fallback is disabled",
+        "from cosmos_rl.utils.video_pixel_bounds import normalize_video_pixel_bounds",
+        "normalize_video_pixel_bounds(ele, image_patch_size, sys.modules[__name__])",
     )
     missing = [marker for marker in required if marker not in source]
     if missing:
