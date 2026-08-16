@@ -12,6 +12,14 @@ import pytest
 SCRIPT = (
     Path(__file__).parents[1] / "cosmos_rl" / "utils" / "runtime_dependency_contract.py"
 )
+PACKER = (
+    Path(__file__).parents[1]
+    / "cosmos_rl"
+    / "dispatcher"
+    / "data"
+    / "packer"
+    / "hf_vlm_data_packer.py"
+)
 SPEC = importlib.util.spec_from_file_location("runtime_dependency_contract", SCRIPT)
 assert SPEC and SPEC.loader
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -116,3 +124,16 @@ def test_deepep_symbol_contract_reports_only_missing_symbols() -> None:
         )
     )
     assert missing_deepep_symbols(symbols) == ["internode_ll::query_mask_buffer"]
+
+
+def test_qwen_packer_normalizes_video_bounds_before_stale_fetch_reference() -> None:
+    source = PACKER.read_text(encoding="utf-8")
+    function = source.split("def qwen_vl_process_vision_info(", 1)[1].split(
+        "\ndef process_vision_info(", 1
+    )[0]
+
+    assert "normalize_video_pixel_bounds(" in function
+    assert "vision_process" in function
+    assert function.index("normalize_video_pixel_bounds(") < function.index(
+        "fetch_video("
+    )
