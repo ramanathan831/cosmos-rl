@@ -33,6 +33,10 @@ def normalize_video_pixel_bounds(
     maximum = int(maximum)
     if maximum < 1:
         raise ValueError(f"max_pixels must be positive, got {maximum}")
+    # TOML-backed configuration can preserve numeric values as strings in the
+    # message content. Qwen resumes with this same dictionary after the reader
+    # returns, so canonicalize the shared object, not only the local value.
+    element["max_pixels"] = maximum
 
     configured_minimum = element.get("min_pixels")
     if configured_minimum is not None:
@@ -46,6 +50,7 @@ def normalize_video_pixel_bounds(
                 "explicit video pixel bounds are contradictory: "
                 f"max_pixels={maximum} < min_pixels={configured_minimum}"
             )
+        element["min_pixels"] = configured_minimum
         return element
 
     merge_size = int(vision_process.SPATIAL_MERGE_SIZE)
