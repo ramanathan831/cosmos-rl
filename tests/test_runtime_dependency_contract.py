@@ -78,6 +78,16 @@ def test_repair_qwen_pynv_worker_source_rejects_unknown_source() -> None:
         repair_qwen_pynv_worker_source("def fetch_video(): pass")
 
 
+def test_repair_qwen_pynv_worker_source_rejects_stale_worker_contract() -> None:
+    repaired, _ = repair_qwen_pynv_worker_source(QWEN_SOURCE)
+    stale = repaired.replace(
+        '        decoder_cache_size=int(os.getenv("TAO_PYNV_DECODER_CACHE_SIZE", "1")),\n',
+        "",
+    )
+    with pytest.raises(RuntimeError, match="Unrecognized qwen-vl-utils"):
+        repair_qwen_pynv_worker_source(stale)
+
+
 def test_deepep_symbol_contract_reports_only_missing_symbols() -> None:
     symbols = "\n".join(
         (
