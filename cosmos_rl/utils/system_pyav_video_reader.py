@@ -24,6 +24,8 @@ import av
 import numpy as np
 import torch
 
+from cosmos_rl.utils.video_pixel_bounds import normalize_video_pixel_bounds
+
 
 _CACHE_MAX_ITEMS = max(0, int(os.environ.get("COSMOS_VIDEO_CACHE_ITEMS", "8")))
 _CACHE: OrderedDict[tuple[Any, ...], tuple[torch.Tensor, dict[str, Any], float]] = (
@@ -241,6 +243,12 @@ def fetch_video_system_pyav_cached(
     """
     if _ORIGINAL_FETCH_VIDEO is None:
         raise RuntimeError("system PyAV video reader has not been registered")
+
+    import qwen_vl_utils.vision_process as vision_process
+
+    element = normalize_video_pixel_bounds(
+        element, image_patch_size, vision_process
+    )
 
     key = _processed_cache_key(
         element,

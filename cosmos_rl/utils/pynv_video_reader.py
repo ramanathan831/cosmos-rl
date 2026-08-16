@@ -14,6 +14,8 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
+from cosmos_rl.utils.video_pixel_bounds import normalize_video_pixel_bounds
+
 
 def _is_nvdec_capability_error(error: BaseException) -> bool:
     """Return whether an exception reports a permanent NVDEC limitation.
@@ -518,6 +520,9 @@ def register_pynv_video_reader(
         return_video_metadata=False,
     ):
         """Cache the fully resized Qwen result, not full-resolution RGB frames."""
+        element = normalize_video_pixel_bounds(
+            element, image_patch_size, vision_process
+        )
         key = tuple(
             element.get(name)
             for name in (
