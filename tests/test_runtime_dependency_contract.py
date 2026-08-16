@@ -68,6 +68,7 @@ def test_repair_qwen_pynv_worker_source_is_idempotent() -> None:
     assert changed
     assert "def _ensure_forced_video_reader(" in repaired
     assert "_ensure_forced_video_reader(video_reader_backend)" in repaired
+    assert 'os.getenv("TAO_PYNV_DECODER_CACHE_SIZE", "1")' in repaired
     assert "strict GPU video decoding failed; CPU fallback is disabled" in repaired
     assert repair_qwen_pynv_worker_source(repaired) == (repaired, False)
 
