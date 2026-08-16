@@ -38,7 +38,7 @@ from cosmos_rl.dispatcher.data.schema import ChatMessage
 from cosmos_rl.dispatcher.data.packer.base import DataPacker
 from cosmos_rl.utils.video_pixel_bounds import normalize_video_pixel_bounds
 
-from qwen_vl_utils import fetch_image, fetch_video
+from qwen_vl_utils import fetch_image
 import qwen_vl_utils.vision_process as vision_process
 
 IGNORE_LABEL_ID = -100
@@ -139,7 +139,13 @@ def qwen_vl_process_vision_info(
                 image_patch_size,
                 vision_process,
             )
-            video_input, video_sample_fps = fetch_video(
+            # Resolve fetch_video dynamically from vision_process.  Spawned
+            # DataLoader workers install the PyNv processed-video cache on
+            # this module before/while selecting the forced backend.  A
+            # function imported by value here would retain Qwen's original
+            # uncached function and silently bypass that lazy in-training
+            # cache for every sample.
+            video_input, video_sample_fps = vision_process.fetch_video(
                 vision_info,
                 return_video_sample_fps=True,
                 image_patch_size=image_patch_size,

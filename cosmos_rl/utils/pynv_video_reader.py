@@ -113,6 +113,8 @@ def register_pynv_video_reader(
     processed_cache: OrderedDict[tuple[Any, ...], Any] = OrderedDict()
     processed_inflight: dict[tuple[Any, ...], threading.Event] = {}
     cache_lock = threading.RLock()
+    cache_stats = {"hits": 0, "misses": 0, "evictions": 0}
+    cache_hit_attested = False
     decoder_lock = threading.RLock()
     cuda_state: dict[str, Any] = {}
     decode_attested = False
@@ -520,6 +522,7 @@ def register_pynv_video_reader(
         return_video_metadata=False,
     ):
         """Cache the fully resized Qwen result, not full-resolution RGB frames."""
+        nonlocal cache_hit_attested
         element = normalize_video_pixel_bounds(
             element, image_patch_size, vision_process
         )
@@ -548,12 +551,28 @@ def register_pynv_video_reader(
             with cache_lock:
                 cached = processed_cache.get(key)
                 if cached is not None:
+                    cache_stats["hits"] += 1
                     processed_cache.move_to_end(key)
+                    if not cache_hit_attested:
+                        worker_info = torch.utils.data.get_worker_info()
+                        worker_id = worker_info.id if worker_info is not None else -1
+                        print(
+                            "TAO_PYNV_VIDEO_CACHE_HIT_ATTESTATION "
+                            f"pid={os.getpid()} "
+                            f"local_rank={os.environ.get('LOCAL_RANK', '0')} "
+                            f"worker_id={worker_id} "
+                            f"capacity={cache_size} "
+                            f"entries={len(processed_cache)} "
+                            "cache_boundary=processed_fetch_video",
+                            flush=True,
+                        )
+                        cache_hit_attested = True
                     return cached
                 event = processed_inflight.get(key)
                 if event is None:
                     event = threading.Event()
                     processed_inflight[key] = event
+                    cache_stats["misses"] += 1
                     owner = True
                 else:
                     owner = False
@@ -574,6 +593,7 @@ def register_pynv_video_reader(
                     processed_cache.move_to_end(key)
                     while len(processed_cache) > cache_size:
                         processed_cache.popitem(last=False)
+                        cache_stats["evictions"] += 1
             return result
         finally:
             with cache_lock:
@@ -582,6 +602,7 @@ def register_pynv_video_reader(
                     completed.set()
 
     vision_process.fetch_video = fetch_video_pynv_cached
+    vision_process._tao_pynv_processed_cache_stats = cache_stats
     if strict:
 
         def reject_cpu_fallback(_element):

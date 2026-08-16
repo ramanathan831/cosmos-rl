@@ -208,6 +208,40 @@ def test_gpu_reader_exports_spawn_worker_contract(tmp_path, monkeypatch):
         vision.VIDEO_READER_BACKENDS["torchvision"]({"video": str(video)})
 
 
+def test_processed_fetch_video_cache_reports_hits(monkeypatch, capsys):
+    class Decoder:
+        def __init__(self, _path, **_kwargs):
+            pass
+
+        def stop(self):
+            pass
+
+    vision = _install_fake_runtime(monkeypatch, Decoder)
+    calls = []
+    expected = (torch.zeros((8, 3, 2, 2), dtype=torch.uint8), 30.0)
+
+    def original_fetch_video(element, **_kwargs):
+        calls.append(dict(element))
+        return expected
+
+    vision.fetch_video = original_fetch_video
+    register_pynv_video_reader(cache_size=4, strict=True)
+
+    element = {"video": "logical.mp4", "nframes": 8}
+    assert vision.fetch_video(element) is expected
+    assert vision.fetch_video(element) is expected
+
+    assert len(calls) == 1
+    assert vision._tao_pynv_processed_cache_stats == {
+        "hits": 1,
+        "misses": 1,
+        "evictions": 0,
+    }
+    output = capsys.readouterr().out
+    assert output.count("TAO_PYNV_VIDEO_CACHE_HIT_ATTESTATION") == 1
+    assert "cache_boundary=processed_fetch_video" in output
+
+
 def test_gpu_reader_rescans_overstated_container_frame_count(
     tmp_path, monkeypatch, capsys
 ):
