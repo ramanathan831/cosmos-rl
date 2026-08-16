@@ -55,8 +55,12 @@ def normalize_video_pixel_bounds(
     if maximum >= runtime_default_minimum:
         return element
 
-    normalized = dict(element)
-    normalized["min_pixels"] = maximum
+    # qwen-vl-utils calls the selected reader backend first and then resumes
+    # inside its outer ``fetch_video`` with the same element dictionary.  The
+    # normalized minimum must therefore be visible on that original object;
+    # returning only a copy is too late and the outer resize would still use
+    # its larger runtime default.
+    element["min_pixels"] = maximum
     signature = (maximum, runtime_default_minimum, int(image_patch_size))
     if signature not in _ATTESTED:
         with _ATTESTATION_LOCK:
@@ -71,4 +75,4 @@ def normalize_video_pixel_bounds(
                     flush=True,
                 )
                 _ATTESTED.add(signature)
-    return normalized
+    return element

@@ -1037,15 +1037,15 @@ cosmos-rl --config config.toml"""
                     processes.remove(process)
             except Exception as e:
                 logger.error(f"Error monitoring process {i}: {e}")
-                # Terminate all remaining processes
-                if controller_id == -1 or i == controller_id:
-                    for p in processes:
-                        try:
-                            p.kill()
-                        except Exception as e:
-                            logger.error(f"Error kill process {p}: {e}")
-                    logger.error("Terminated all processes due to error")
-                    sys.exit(1)
+                # A monitoring exception is just as terminal as a nonzero
+                # child return: there is no safe in-place recovery path.
+                for p in processes:
+                    try:
+                        p.kill()
+                    except Exception as kill_error:
+                        logger.error(f"Error kill process {p}: {kill_error}")
+                logger.error("Terminated all processes due to monitoring error")
+                sys.exit(1)
         # Small sleep to prevent busy waiting
         time.sleep(0.1)
 

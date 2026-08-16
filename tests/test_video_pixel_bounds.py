@@ -18,7 +18,7 @@ normalize_video_pixel_bounds = video_pixel_bounds.normalize_video_pixel_bounds
 RUNTIME = SimpleNamespace(VIDEO_MIN_TOKEN_NUM=128, SPATIAL_MERGE_SIZE=2)
 
 
-def test_missing_minimum_is_normalized_without_raising_explicit_maximum() -> None:
+def test_missing_minimum_is_normalized_on_the_reader_input_object() -> None:
     source = {"video": "clip.mp4", "max_pixels": 81920}
 
     normalized = normalize_video_pixel_bounds(source, 16, RUNTIME)
@@ -28,7 +28,8 @@ def test_missing_minimum_is_normalized_without_raising_explicit_maximum() -> Non
         "min_pixels": 81920,
         "max_pixels": 81920,
     }
-    assert source == {"video": "clip.mp4", "max_pixels": 81920}
+    assert normalized is source
+    assert source["min_pixels"] == source["max_pixels"]
 
 
 def test_runtime_default_is_preserved_when_it_fits_explicit_maximum() -> None:
@@ -50,3 +51,11 @@ def test_contradictory_explicit_bounds_fail() -> None:
         normalize_video_pixel_bounds(
             {"min_pixels": 131072, "max_pixels": 81920}, 16, RUNTIME
         )
+
+
+def test_launcher_propagates_every_child_failure() -> None:
+    launcher = (
+        Path(__file__).parents[1] / "cosmos_rl" / "launcher" / "launch_all.py"
+    ).read_text()
+    assert "controller_id == -1 or i == controller_id" not in launcher
+    assert "Propagate every child failure immediately" in launcher
