@@ -49,6 +49,7 @@ def _ensure_forced_video_reader(video_reader_backend: str) -> None:
 
     register_pynv_video_reader(
         cache_size=int(os.getenv("TAO_PYNV_VIDEO_CACHE_SIZE", "0")),
+        decoder_cache_size=int(os.getenv("TAO_PYNV_DECODER_CACHE_SIZE", "1")),
         video_override_map=os.getenv("TAO_PYNV_VIDEO_OVERRIDE_MAP") or None,
         strict=_env_flag("TAO_PYNV_VIDEO_STRICT", True),
     )
