@@ -130,6 +130,7 @@ def repair_qwen_pynv_worker_source(source: str) -> tuple[str, bool]:
     markers = (
         "def _ensure_forced_video_reader(",
         "_ensure_forced_video_reader(video_reader_backend)",
+        'os.getenv("TAO_PYNV_DECODER_CACHE_SIZE", "1")',
         "strict GPU video decoding failed; CPU fallback is disabled",
     )
     if all(marker in source for marker in markers):
@@ -178,6 +179,7 @@ def verify_qwen_pynv_worker() -> None:
     required = (
         "def _ensure_forced_video_reader(",
         "_ensure_forced_video_reader(video_reader_backend)",
+        'os.getenv("TAO_PYNV_DECODER_CACHE_SIZE", "1")',
         "strict GPU video decoding failed; CPU fallback is disabled",
     )
     missing = [marker for marker in required if marker not in source]
