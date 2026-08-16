@@ -18,13 +18,16 @@ from cosmos_rl.utils.video_pixel_bounds import normalize_video_pixel_bounds
 
 
 def _is_nvdec_capability_error(error: BaseException) -> bool:
-    """Return whether an exception reports a permanent NVDEC limitation.
+    """Return whether an exception reports a permanent GPU-reader limitation.
 
     PyNvVideoCodec exposes unsupported stream/GPU combinations through a
-    dedicated exception type.  Keep a message check for wrapper releases that
-    preserve the native error text while translating the Python exception.
-    Do not classify ordinary decode, I/O, or programming errors as capability
-    misses: those must keep failing the strict fast profile.
+    dedicated exception type.  Its FFmpeg demuxer also reports a stable seek
+    error when a stream has no usable random-access index; uniform frame
+    sampling cannot proceed through PyNv on such a stream.  Keep narrow message
+    checks for wrapper releases that preserve those native errors while
+    translating the Python exception.  Do not classify ordinary decode, I/O,
+    or programming errors as capability misses: those must keep failing the
+    strict fast profile.
     """
     seen: set[int] = set()
     current: BaseException | None = error
@@ -39,6 +42,10 @@ def _is_nvdec_capability_error(error: BaseException) -> bool:
             "error code : 801" in message
             or "not supported on this gpu" in message
             or "unsupported" in message
+            or (
+                "seek target index is out of range" in message
+                and "no matching index entry" in message
+            )
         ):
             return True
         current = current.__cause__ or current.__context__
