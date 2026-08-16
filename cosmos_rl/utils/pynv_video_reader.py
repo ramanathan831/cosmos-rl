@@ -15,6 +15,34 @@ from pathlib import Path
 from typing import Any
 
 
+def _is_nvdec_capability_error(error: BaseException) -> bool:
+    """Return whether an exception reports a permanent NVDEC limitation.
+
+    PyNvVideoCodec exposes unsupported stream/GPU combinations through a
+    dedicated exception type.  Keep a message check for wrapper releases that
+    preserve the native error text while translating the Python exception.
+    Do not classify ordinary decode, I/O, or programming errors as capability
+    misses: those must keep failing the strict fast profile.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        names = {cls.__name__ for cls in type(current).__mro__}
+        message = str(current).lower()
+        pynv_error = any("pynvvc" in name.lower() for name in names)
+        if "PyNvVCExceptionUnsupported" in names:
+            return True
+        if pynv_error and (
+            "error code : 801" in message
+            or "not supported on this gpu" in message
+            or "unsupported" in message
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 def register_pynv_video_reader(
     *,
     cache_size: int = 0,
@@ -57,6 +85,15 @@ def register_pynv_video_reader(
         raise RuntimeError(
             "GPU video decoding requires PyNvVideoCodec, cuda.bindings, and qwen-vl-utils"
         ) from exc
+    from cosmos_rl.utils.system_pyav_video_reader import (
+        _assert_software_video_decoders,
+        read_video_system_pyav,
+    )
+
+    # The fast profile remains NVDEC/device-RGBP first.  Prove once at process
+    # setup that its capability-only safety path is the checksum-pinned sparse
+    # software reader, rather than Qwen's broad implicit fallback.
+    software_codecs = _assert_software_video_decoders()
 
     overrides: dict[str, str] = {}
     if video_override_map:
@@ -77,6 +114,8 @@ def register_pynv_video_reader(
     decoder_lock = threading.RLock()
     cuda_state: dict[str, Any] = {}
     decode_attested = False
+    fallback_attested = False
+    software_only_paths: set[str] = set()
 
     def release_decoder(decoder) -> None:
         """Best-effort release across PyNvVideoCodec wrapper variants."""
@@ -235,6 +274,42 @@ def register_pynv_video_reader(
             raise RuntimeError(f"decoder returned no frames for {video_path}")
         return video
 
+    def discard_active_decoder() -> None:
+        decoder = cuda_state.pop("decoder", None)
+        cuda_state.pop("decoder_path", None)
+        if decoder is not None:
+            release_decoder(decoder)
+            del decoder
+
+    def read_video_capability_fallback(
+        element: dict[str, Any],
+        video_path: str,
+        error: BaseException | None,
+    ):
+        """Decode one NVDEC-incompatible stream without changing profiles."""
+        nonlocal fallback_attested
+        software_only_paths.add(video_path)
+        software_element = dict(element)
+        software_element["video"] = video_path
+        if not fallback_attested:
+            print(
+                "TAO_VIDEO_DECODER_CAPABILITY_FALLBACK_ATTESTATION "
+                "primary=pynvvideocodec "
+                "fallback=tao_system_pyav_sparse "
+                f"software_codecs={software_codecs} "
+                "scope=nvdec_unsupported_stream_only",
+                flush=True,
+            )
+            fallback_attested = True
+        print(
+            "TAO_VIDEO_DECODER_CAPABILITY_FALLBACK "
+            f"primary=pynvvideocodec video={video_path} "
+            "fallback=tao_system_pyav_sparse "
+            f"reason={type(error).__name__ if error is not None else 'cached_capability'}",
+            flush=True,
+        )
+        return read_video_system_pyav(software_element)
+
     def read_video_pynv(element):
         nonlocal decode_attested
         with decoder_lock:
@@ -247,172 +322,185 @@ def register_pynv_video_reader(
                 )
             video_path = overrides.get(video_path, video_path)
             video_path = str(Path(video_path).expanduser().resolve(strict=True))
-            cuda_context, cuda_stream, gpu_id = get_cuda_state()
-            cuda_check(
-                cuda_driver.cuCtxSetCurrent(cuda_state["context"]), "cuCtxSetCurrent"
-            )
-            decoder = cuda_state.get("decoder")
-            if decoder is not None and cuda_state["decoder_path"] != video_path:
-                if decoder_cache_size > 1:
-                    # The explicit fast profile keeps PyNvVideoCodec's native
-                    # decoder/session cache alive across repeated media. Any
-                    # omission or stale metadata is still caught by the exact
-                    # batch-size gate and recovered through the scanned path.
-                    try:
-                        decoder.reconfigure_decoder(video_path)
-                        cuda_state["decoder_path"] = video_path
-                    except Exception:
-                        cuda_state.pop("decoder", None)
-                        cuda_state.pop("decoder_path", None)
-                        release_decoder(decoder)
-                        del decoder
-                        decoder = None
-                else:
-                    # The conservative default isolates decoder sessions per
-                    # source while retaining the rank-local CUDA context.
-                    cuda_state.pop("decoder", None)
-                    cuda_state.pop("decoder_path", None)
-                    release_decoder(decoder)
-                    del decoder
-                    decoder = None
-            if decoder is None:
-                decoder = make_decoder(
-                    video_path, cuda_context, cuda_stream, gpu_id
-                )
-                cuda_state["decoder"] = decoder
-                cuda_state["decoder_path"] = video_path
-
-            metadata = decoder.get_stream_metadata()
-            source_total_frames = len(decoder)
-            video_fps = float(metadata.average_fps)
-            start_frame, end_frame, selected_total_frames = (
-                vision_process.calculate_video_frame_range(
-                    element, source_total_frames, video_fps
-                )
-            )
-            nframes = vision_process.smart_nframes(
-                element, total_frames=selected_total_frames, video_fps=video_fps
-            )
-            indices = (
-                torch.linspace(start_frame, end_frame, nframes).round().long().tolist()
-            )
             try:
-                batch_frames = decoder.get_batch_frames_by_index(indices)
-                if len(batch_frames) != len(indices):
-                    raise RuntimeError(
-                        f"NVDEC batch returned {len(batch_frames)} of {len(indices)} frames"
+                if video_path in software_only_paths:
+                    return read_video_capability_fallback(
+                        element, video_path, None
                     )
-                video = copy_batch_frames(batch_frames, video_path, gpu_id)
-            except Exception as batch_error:
-                # Some MP4 container metadata overstates the number of
-                # decodable frames. PyNvVideoCodec 2.2.0 then omits the
-                # out-of-range frame from a batch, and direct access to that
-                # index can segfault in native code. Rescan only on this
-                # proven mismatch, recompute the same uniform-frame policy
-                # from the authoritative decodable count, and retry through
-                # NVDEC. Never clamp an index or route through Qwen's CPU
-                # fallback.
-                unscanned_total_frames = source_total_frames
-                unscanned_indices = indices
-                cuda_state.pop("decoder", None)
-                cuda_state.pop("decoder_path", None)
-                release_decoder(decoder)
-                del decoder
-                print(
-                    "TAO_GPU_VIDEO_BATCH_RETRY "
-                    f"backend=pynvvideocodec video={video_path} "
-                    f"indices={unscanned_indices} "
-                    f"unscanned_total_frames={unscanned_total_frames} "
-                    f"error={type(batch_error).__name__}",
-                    flush=True,
+                cuda_context, cuda_stream, gpu_id = get_cuda_state()
+                cuda_check(
+                    cuda_driver.cuCtxSetCurrent(cuda_state["context"]),
+                    "cuCtxSetCurrent",
                 )
-                video = None
-                last_error = batch_error
-                for _attempt in range(3):
-                    retry_decoder = make_decoder(
-                        video_path,
-                        cuda_context,
-                        cuda_stream,
-                        gpu_id,
-                        scan_stream_metadata=True,
-                        session_cache_size=1,
+                decoder = cuda_state.get("decoder")
+                if decoder is not None and cuda_state["decoder_path"] != video_path:
+                    if decoder_cache_size > 1:
+                        # The explicit fast profile keeps PyNvVideoCodec's native
+                        # decoder/session cache alive across repeated media. Any
+                        # omission or stale metadata is still caught by the exact
+                        # batch-size gate and recovered through the scanned path.
+                        try:
+                            decoder.reconfigure_decoder(video_path)
+                            cuda_state["decoder_path"] = video_path
+                        except Exception:
+                            discard_active_decoder()
+                            decoder = None
+                    else:
+                        # The conservative default isolates decoder sessions per
+                        # source while retaining the rank-local CUDA context.
+                        discard_active_decoder()
+                        decoder = None
+                if decoder is None:
+                    decoder = make_decoder(
+                        video_path, cuda_context, cuda_stream, gpu_id
                     )
-                    try:
-                        metadata = retry_decoder.get_stream_metadata()
-                        source_total_frames = len(retry_decoder)
-                        video_fps = float(metadata.average_fps)
-                        start_frame, end_frame, selected_total_frames = (
-                            vision_process.calculate_video_frame_range(
-                                element, source_total_frames, video_fps
-                            )
-                        )
-                        nframes = vision_process.smart_nframes(
-                            element,
-                            total_frames=selected_total_frames,
-                            video_fps=video_fps,
-                        )
-                        indices = (
-                            torch.linspace(start_frame, end_frame, nframes)
-                            .round()
-                            .long()
-                            .tolist()
-                        )
-                        batch_frames = retry_decoder.get_batch_frames_by_index(indices)
-                        if len(batch_frames) != len(indices):
-                            raise RuntimeError(
-                                "scanned NVDEC batch returned "
-                                f"{len(batch_frames)} of {len(indices)} frames"
-                            )
-                        video = copy_batch_frames(
-                            batch_frames, video_path, gpu_id
-                        )
-                        cuda_state["decoder"] = retry_decoder
-                        cuda_state["decoder_path"] = video_path
-                        last_error = None
-                        print(
-                            "TAO_GPU_VIDEO_BATCH_RECOVERED "
-                            f"backend=pynvvideocodec video={video_path} "
-                            f"unscanned_total_frames={unscanned_total_frames} "
-                            f"scanned_total_frames={source_total_frames} "
-                            f"indices={indices}",
-                            flush=True,
-                        )
-                        break
-                    except Exception as exc:
-                        last_error = exc
-                        release_decoder(retry_decoder)
-                        del retry_decoder
-                if last_error is not None or video is None:
-                    raise RuntimeError(
-                        "GPU-only PyNvVideoCodec scanned retry failed for "
-                        f"{video_path} indices {indices}"
-                    ) from last_error
-            sample_fps = nframes / max(selected_total_frames, 1.0) * video_fps
-            result = (
-                video,
-                {
-                    "fps": video_fps,
-                    "frames_indices": indices,
-                    "total_num_frames": selected_total_frames,
-                    "video_backend": "pynvvideocodec",
-                },
-                sample_fps,
-            )
-            if not decode_attested:
-                worker_info = torch.utils.data.get_worker_info()
-                worker_id = worker_info.id if worker_info is not None else -1
-                print(
-                    "TAO_GPU_VIDEO_DECODE_ATTESTATION "
-                    f"backend=pynvvideocodec pid={os.getpid()} "
-                    f"local_rank={os.environ.get('LOCAL_RANK', '0')} "
-                    f"worker_id={worker_id} gpu_ordinal={gpu_id} "
-                    f"decoded_frames={len(indices)} "
-                    f"frame_transfer={frame_transfer} "
-                    f"decoder_cache_size={decoder_cache_size}",
-                    flush=True,
+                    cuda_state["decoder"] = decoder
+                    cuda_state["decoder_path"] = video_path
+
+                metadata = decoder.get_stream_metadata()
+                source_total_frames = len(decoder)
+                video_fps = float(metadata.average_fps)
+                start_frame, end_frame, selected_total_frames = (
+                    vision_process.calculate_video_frame_range(
+                        element, source_total_frames, video_fps
+                    )
                 )
-                decode_attested = True
-            return result
+                nframes = vision_process.smart_nframes(
+                    element,
+                    total_frames=selected_total_frames,
+                    video_fps=video_fps,
+                )
+                indices = (
+                    torch.linspace(start_frame, end_frame, nframes)
+                    .round()
+                    .long()
+                    .tolist()
+                )
+                try:
+                    batch_frames = decoder.get_batch_frames_by_index(indices)
+                    if len(batch_frames) != len(indices):
+                        raise RuntimeError(
+                            f"NVDEC batch returned {len(batch_frames)} of {len(indices)} frames"
+                        )
+                    video = copy_batch_frames(batch_frames, video_path, gpu_id)
+                except Exception as batch_error:
+                    if _is_nvdec_capability_error(batch_error):
+                        raise
+                    # Some MP4 container metadata overstates the number of
+                    # decodable frames. PyNvVideoCodec 2.2.0 then omits the
+                    # out-of-range frame from a batch, and direct access to that
+                    # index can segfault in native code. Rescan only on this
+                    # proven mismatch, recompute the same uniform-frame policy
+                    # from the authoritative decodable count, and retry through
+                    # NVDEC. Never clamp an index or route through Qwen's broad
+                    # implicit fallback.
+                    unscanned_total_frames = source_total_frames
+                    unscanned_indices = indices
+                    discard_active_decoder()
+                    print(
+                        "TAO_GPU_VIDEO_BATCH_RETRY "
+                        f"backend=pynvvideocodec video={video_path} "
+                        f"indices={unscanned_indices} "
+                        f"unscanned_total_frames={unscanned_total_frames} "
+                        f"error={type(batch_error).__name__}",
+                        flush=True,
+                    )
+                    video = None
+                    last_error = batch_error
+                    for _attempt in range(3):
+                        retry_decoder = make_decoder(
+                            video_path,
+                            cuda_context,
+                            cuda_stream,
+                            gpu_id,
+                            scan_stream_metadata=True,
+                            session_cache_size=1,
+                        )
+                        try:
+                            metadata = retry_decoder.get_stream_metadata()
+                            source_total_frames = len(retry_decoder)
+                            video_fps = float(metadata.average_fps)
+                            start_frame, end_frame, selected_total_frames = (
+                                vision_process.calculate_video_frame_range(
+                                    element, source_total_frames, video_fps
+                                )
+                            )
+                            nframes = vision_process.smart_nframes(
+                                element,
+                                total_frames=selected_total_frames,
+                                video_fps=video_fps,
+                            )
+                            indices = (
+                                torch.linspace(start_frame, end_frame, nframes)
+                                .round()
+                                .long()
+                                .tolist()
+                            )
+                            batch_frames = retry_decoder.get_batch_frames_by_index(indices)
+                            if len(batch_frames) != len(indices):
+                                raise RuntimeError(
+                                    "scanned NVDEC batch returned "
+                                    f"{len(batch_frames)} of {len(indices)} frames"
+                                )
+                            video = copy_batch_frames(
+                                batch_frames, video_path, gpu_id
+                            )
+                            cuda_state["decoder"] = retry_decoder
+                            cuda_state["decoder_path"] = video_path
+                            last_error = None
+                            print(
+                                "TAO_GPU_VIDEO_BATCH_RECOVERED "
+                                f"backend=pynvvideocodec video={video_path} "
+                                f"unscanned_total_frames={unscanned_total_frames} "
+                                f"scanned_total_frames={source_total_frames} "
+                                f"indices={indices}",
+                                flush=True,
+                            )
+                            break
+                        except Exception as exc:
+                            last_error = exc
+                            release_decoder(retry_decoder)
+                            del retry_decoder
+                            if _is_nvdec_capability_error(exc):
+                                break
+                    if last_error is not None or video is None:
+                        raise RuntimeError(
+                            "GPU-only PyNvVideoCodec scanned retry failed for "
+                            f"{video_path} indices {indices}"
+                        ) from last_error
+                sample_fps = nframes / max(selected_total_frames, 1.0) * video_fps
+                result = (
+                    video,
+                    {
+                        "fps": video_fps,
+                        "frames_indices": indices,
+                        "total_num_frames": selected_total_frames,
+                        "video_backend": "pynvvideocodec",
+                    },
+                    sample_fps,
+                )
+                if not decode_attested:
+                    worker_info = torch.utils.data.get_worker_info()
+                    worker_id = worker_info.id if worker_info is not None else -1
+                    print(
+                        "TAO_GPU_VIDEO_DECODE_ATTESTATION "
+                        f"backend=pynvvideocodec pid={os.getpid()} "
+                        f"local_rank={os.environ.get('LOCAL_RANK', '0')} "
+                        f"worker_id={worker_id} gpu_ordinal={gpu_id} "
+                        f"decoded_frames={len(indices)} "
+                        f"frame_transfer={frame_transfer} "
+                        f"decoder_cache_size={decoder_cache_size}",
+                        flush=True,
+                    )
+                    decode_attested = True
+                return result
+            except Exception as error:
+                if not _is_nvdec_capability_error(error):
+                    raise
+                discard_active_decoder()
+                return read_video_capability_fallback(
+                    element, video_path, error
+                )
 
     vision_process.VIDEO_READER_BACKENDS["pynvvideocodec"] = read_video_pynv
 
@@ -506,6 +594,8 @@ def register_pynv_video_reader(
         "decoder_cache_size": decoder_cache_size,
         "frame_transfer": frame_transfer,
         "cache_boundary": "processed_fetch_video",
+        "capability_fallback": "tao_system_pyav_sparse",
+        "capability_fallback_scope": "nvdec_unsupported_stream_only",
         "video_overrides": len(overrides),
         "strict": strict,
     }
