@@ -789,12 +789,26 @@ class HFVLMDataPacker(DataPacker):
         if batch_num_images is not None:
             batch["batch_num_images"] = batch_num_images
 
-        # Pad the input_ids, logprob_masks
+        # Pad input_ids and build the mask from the unpadded lengths.  Do not
+        # infer padding from the token value: some tokenizers reuse a regular
+        # vocabulary token as ``pad_token_id``.  An explicit attention mask is
+        # also required by recent Transformers releases for multimodal models
+        # whose MRoPE position ids are not monotonically increasing.  Without
+        # it, Transformers can mis-detect an ordinary padded batch as packed
+        # sequences and sever text-to-vision attention during SFT.
         batch["input_ids"] = torch.tensor(
             [
                 x["input_ids"][:computed_max_len]
                 + [self.tokenizer.pad_token_id]
                 * (max(0, computed_max_len - len(x["input_ids"])))
+                for x in processed_samples
+            ],
+            dtype=torch.long,
+        )
+        batch["attention_mask"] = torch.tensor(
+            [
+                [1] * min(len(x["input_ids"]), computed_max_len)
+                + [0] * max(0, computed_max_len - len(x["input_ids"]))
                 for x in processed_samples
             ],
             dtype=torch.long,
@@ -843,8 +857,13 @@ class HFVLMDataPacker(DataPacker):
             dtype=torch.bool,
         )
 
-        assert len(batch["input_ids"]) == len(batch["logprob_masks"]), (
-            "The length of input_ids, logprob_masks should be the same"
+        assert (
+            batch["input_ids"].shape
+            == batch["attention_mask"].shape
+            == batch["logprob_masks"].shape
+        ), (
+            "The shapes of input_ids, attention_mask, and logprob_masks "
+            "should be the same"
         )
 
         return batch
