@@ -37,7 +37,8 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Optional
+from collections import OrderedDict
+from typing import Iterator, Literal, Optional
 
 import cosmos_rl.launcher.worker_entry
 import cosmos_rl.policy.config
@@ -111,6 +112,29 @@ class CustomConfig(pydantic.BaseModel):
     video_decoder_cache_size: int = pydantic.Field(default=4, ge=1)
     video_override_map: str | None = None
 
+    validation_shard_strategy: Literal["stride", "media_grouped"] = "stride"
+    """Validation sharding policy.
+
+    ``media_grouped`` preserves DistributedSampler's exact padded multiset and
+    per-rank sample count, but orders records by media before splitting the
+    stream into equal contiguous rank slices.  This keeps repeated questions
+    for a video on as few ranks as possible so the on-demand video cache can be
+    effective without changing validation coverage or loss weighting.
+    """
+
+    validation_cache_frontload_batch_size: int = pydantic.Field(default=0, ge=0)
+    validation_cache_frontload_unique_per_batch: int = pydantic.Field(
+        default=0, ge=0
+    )
+    """Optional staged population of the validation video-feature cache.
+
+    When both values are positive, each early validation batch introduces at
+    most ``validation_cache_frontload_unique_per_batch`` unseen rank-local
+    media groups.  Remaining slots use already introduced groups.  This keeps
+    decoder work pipelineable with model forward while preserving the exact
+    validation index multiset and loss weighting.
+    """
+
     vision: VisionConfig = pydantic.Field(
         default=VisionConfig(
             fps=1,
@@ -175,6 +199,25 @@ class CustomDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.annotation)
 
+    def media_key(self, idx: int) -> tuple[str, ...]:
+        """Return the resolved media identity used by validation sharding."""
+        sample = self.annotation[idx]
+        paths: list[str] = []
+        for singular, plural in (("video", "videos"), ("image", "images")):
+            values = sample.get(singular, None) or sample.get(plural, None)
+            if not values:
+                continue
+            if isinstance(values, str):
+                values = [values]
+            for value in values:
+                path = (
+                    os.path.join(self.media_path, value) if self.media_path else value
+                )
+                paths.append(os.path.normpath(path))
+        # Text-only records must remain independent instead of collapsing into
+        # one artificial group.
+        return tuple(paths) if paths else (f"__sample__:{idx}",)
+
     def __getitem__(self, idx: int) -> list[dict]:
         sample = self.annotation[idx]
 
@@ -233,6 +276,185 @@ class CustomDataset(torch.utils.data.Dataset):
             conversations.append({"role": "assistant", "content": response})
 
         return conversations
+
+
+class MediaGroupedDistributedSampler(torch.utils.data.Sampler[int]):
+    """Equal-length deterministic validation shards with media locality.
+
+    The initial index multiset is deliberately identical to PyTorch's
+    ``DistributedSampler(shuffle=False, drop_last=False)``: records are padded
+    with the leading indices to ``ceil(N / replicas) * replicas``.  The only
+    change is ordering.  Records are grouped by media in first-seen order and
+    the grouped stream is cut into equal contiguous rank slices.  At most one
+    media group is split at each rank boundary.  Inside each rank, one record
+    from every assigned media group is front-loaded before the remaining
+    records.  This populates an on-demand feature cache in the fewest batches,
+    allowing later validation batches to skip the vision encoder collectively.
+    """
+
+    cache_frontload_batch_size = 0
+    cache_frontload_unique_per_batch = 0
+
+    def __init__(
+        self,
+        dataset,
+        num_replicas: int,
+        rank: int,
+        shuffle: bool = False,
+        drop_last: bool = False,
+    ) -> None:
+        if num_replicas <= 0:
+            raise ValueError("num_replicas must be positive")
+        if not 0 <= rank < num_replicas:
+            raise ValueError(f"rank {rank} is outside [0, {num_replicas})")
+        if shuffle:
+            raise ValueError("media-grouped validation does not support shuffle=True")
+
+        self.dataset = dataset
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.drop_last = drop_last
+        dataset_size = len(dataset)
+        if drop_last and dataset_size % num_replicas:
+            self.num_samples = dataset_size // num_replicas
+        else:
+            self.num_samples = (dataset_size + num_replicas - 1) // num_replicas
+        self.total_size = self.num_samples * num_replicas
+        self._indices, stats = self._build_indices()
+        logger.info(
+            "Media-grouped validation shard: rank=%s/%s samples=%s "
+            "logical_records=%s padded_records=%s media_groups=%s "
+            "rank_media_groups=%s cache_frontloaded_records=%s",
+            self.rank,
+            self.num_replicas,
+            len(self._indices),
+            len(self.dataset),
+            self.total_size - len(self.dataset),
+            stats["media_groups"],
+            stats["rank_media_groups"],
+            stats["cache_frontloaded_records"],
+        )
+
+    def _media_dataset(self):
+        current = self.dataset
+        seen: set[int] = set()
+        while not hasattr(current, "media_key"):
+            identity = id(current)
+            if identity in seen or not hasattr(current, "dataset"):
+                raise TypeError(
+                    "media_grouped validation requires a dataset exposing media_key(index)"
+                )
+            seen.add(identity)
+            current = current.dataset
+        return current
+
+    def _build_indices(self) -> tuple[list[int], dict[str, int]]:
+        indices = list(range(len(self.dataset)))
+        if self.drop_last:
+            indices = indices[: self.total_size]
+        else:
+            padding = self.total_size - len(indices)
+            if padding > 0:
+                if padding <= len(indices):
+                    indices += indices[:padding]
+                else:
+                    repeats = (padding + len(indices) - 1) // len(indices)
+                    indices += (indices * repeats)[:padding]
+
+        media_dataset = self._media_dataset()
+        groups: OrderedDict[tuple[str, ...], list[int]] = OrderedDict()
+        for index in indices:
+            key = tuple(media_dataset.media_key(index))
+            groups.setdefault(key, []).append(index)
+        ordered = [index for group in groups.values() for index in group]
+        if len(ordered) != self.total_size:
+            raise RuntimeError(
+                f"media-grouped sampler produced {len(ordered)} indices; "
+                f"expected {self.total_size}"
+            )
+        start = self.rank * self.num_samples
+        rank_indices = ordered[start : start + self.num_samples]
+        rank_groups: OrderedDict[tuple[str, ...], list[int]] = OrderedDict()
+        for index in rank_indices:
+            key = tuple(media_dataset.media_key(index))
+            rank_groups.setdefault(key, []).append(index)
+        cache_frontloaded = [group[0] for group in rank_groups.values()]
+        cache_remainder = [index for group in rank_groups.values() for index in group[1:]]
+        frontload_batch_size = int(self.cache_frontload_batch_size)
+        frontload_unique_per_batch = int(self.cache_frontload_unique_per_batch)
+        if frontload_batch_size or frontload_unique_per_batch:
+            if (
+                frontload_batch_size <= 0
+                or frontload_unique_per_batch <= 0
+                or frontload_unique_per_batch > frontload_batch_size
+            ):
+                raise ValueError(
+                    "staged validation cache frontloading requires positive "
+                    "batch and unique counts with unique <= batch"
+                )
+            rank_indices = self._staged_cache_frontload(
+                rank_groups,
+                frontload_batch_size,
+                frontload_unique_per_batch,
+            )
+        else:
+            rank_indices = cache_frontloaded + cache_remainder
+        rank_media_groups = len(rank_groups)
+        if len(rank_indices) != self.num_samples:
+            raise RuntimeError(
+                f"media-grouped rank sampler produced {len(rank_indices)} indices; "
+                f"expected {self.num_samples}"
+            )
+        return rank_indices, {
+            "media_groups": len(groups),
+            "rank_media_groups": rank_media_groups,
+            "cache_frontloaded_records": len(cache_frontloaded),
+        }
+
+    @staticmethod
+    def _staged_cache_frontload(
+        rank_groups: OrderedDict[tuple[str, ...], list[int]],
+        batch_size: int,
+        unique_per_batch: int,
+    ) -> list[int]:
+        """Introduce bounded unseen media per early batch, deterministically."""
+        remaining = OrderedDict((key, list(group)) for key, group in rank_groups.items())
+        group_keys = list(remaining)
+        active_keys: list[tuple[str, ...]] = []
+        ordered: list[int] = []
+
+        for start in range(0, len(group_keys), unique_per_batch):
+            new_keys = group_keys[start : start + unique_per_batch]
+            active_keys.extend(new_keys)
+            batch = []
+            for key in new_keys:
+                batch.append(remaining[key].pop(0))
+
+            while len(batch) < batch_size:
+                made_progress = False
+                for key in active_keys:
+                    if remaining[key]:
+                        batch.append(remaining[key].pop(0))
+                        made_progress = True
+                        if len(batch) == batch_size:
+                            break
+                if not made_progress:
+                    break
+            ordered.extend(batch)
+
+        for group in remaining.values():
+            ordered.extend(group)
+        return ordered
+
+    def __iter__(self) -> Iterator[int]:
+        return iter(self._indices)
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def set_epoch(self, epoch: int) -> None:
+        # Validation ordering is intentionally invariant across epochs.
+        del epoch
 
 
 def _get_results_dir() -> str | None:
@@ -434,6 +656,26 @@ def main():
             "TAO logging enabled but TAO_API_JOB_ID not set - skipping TAO status logging"
         )
 
+    # Release rank-local validation features before checkpointing or the next
+    # training epoch.  Compose with the TAO status hook instead of replacing
+    # its validation-complete event.
+    existing_post_validation_hook = hook_fns.get("post_validation_hook")
+
+    def post_validation_and_clear_feature_cache(worker, report_data):
+        try:
+            if existing_post_validation_hook is not None:
+                existing_post_validation_hook(worker, report_data=report_data)
+        finally:
+            clear_cache = getattr(
+                worker.trainer.forward_model,
+                "clear_validation_video_feature_cache",
+                None,
+            )
+            if callable(clear_cache):
+                clear_cache()
+
+    hook_fns["post_validation_hook"] = post_validation_and_clear_feature_cache
+
     # Launch worker with factory functions and TAO logging
     if custom_config.val_dataset:
         val_dataset_factory = get_val_dataset
@@ -452,9 +694,22 @@ def main():
         else:
             logger.info("Validation is disabled; no validation dataset is required.")
 
+    if custom_config.validation_shard_strategy == "media_grouped":
+        MediaGroupedDistributedSampler.cache_frontload_batch_size = (
+            custom_config.validation_cache_frontload_batch_size
+        )
+        MediaGroupedDistributedSampler.cache_frontload_unique_per_batch = (
+            custom_config.validation_cache_frontload_unique_per_batch
+        )
+
     cosmos_rl.launcher.worker_entry.main(
         dataset=get_train_dataset,
         val_dataset=val_dataset_factory,
+        val_sampler=(
+            MediaGroupedDistributedSampler
+            if custom_config.validation_shard_strategy == "media_grouped"
+            else None
+        ),
         custom_logger_fns=custom_logger_fns,
         hook_fns=hook_fns,
     )
