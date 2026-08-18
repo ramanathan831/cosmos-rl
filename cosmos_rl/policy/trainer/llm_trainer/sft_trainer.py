@@ -795,7 +795,13 @@ class SFTTrainer(LLMTrainer):
         if not self.config.validation.enable:
             return
 
-        self.set_model_eval()
+        # ``Module.eval()`` recursively walks the complete model hierarchy.
+        # Validation invokes this method once per batch, so repeating that
+        # traversal is pure overhead after the first batch.  Training restores
+        # train mode before its next forward, which makes this guard safe for
+        # every later validation phase as well.
+        if self.forward_model.training:
+            self.set_model_eval()
         with torch.no_grad():
             fixed_length = (
                 self.config.policy.model_max_length

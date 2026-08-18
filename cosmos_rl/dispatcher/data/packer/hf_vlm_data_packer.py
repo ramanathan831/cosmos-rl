@@ -693,6 +693,22 @@ class HFVLMDataPacker(DataPacker):
     def _collate_fn(
         self, processed_samples: List[Dict[str, Any]], computed_max_len: int
     ) -> Dict[str, Any]:
+        tao_video_cache_keys = []
+        tao_video_cache_keys_valid = True
+        for sample in processed_samples:
+            sample_grid = sample.get("video_grid_thw")
+            if sample_grid is None:
+                continue
+            sample_keys = sample.get("tao_video_cache_keys")
+            grid_rows = int(sample_grid.shape[0])
+            if (
+                not isinstance(sample_keys, (list, tuple))
+                or len(sample_keys) != grid_rows
+            ):
+                tao_video_cache_keys_valid = False
+                break
+            tao_video_cache_keys.extend(str(key) for key in sample_keys)
+
         pixel_values_videos = [x["pixel_values_videos"] for x in processed_samples]
         video_grid_thw = [x["video_grid_thw"] for x in processed_samples]
         second_per_grid_ts = [x["second_per_grid_ts"] for x in processed_samples]
@@ -757,6 +773,18 @@ class HFVLMDataPacker(DataPacker):
 
         if video_grid_thw is not None:
             batch["video_grid_thw"] = video_grid_thw
+
+        if (
+            tao_video_cache_keys_valid
+            and tao_video_cache_keys
+            and video_grid_thw is not None
+            and len(tao_video_cache_keys) == int(video_grid_thw.shape[0])
+        ):
+            # This metadata is consumed by HFModel before its kwargs are
+            # filtered against the Hugging Face forward signature.  Keeping it
+            # as Python strings avoids tensor transfers and keeps checkpoint
+            # state untouched.
+            batch["tao_video_cache_keys"] = tao_video_cache_keys
 
         if second_per_grid_ts is not None:
             batch["second_per_grid_ts"] = second_per_grid_ts
@@ -1011,11 +1039,52 @@ class HFVLMDataPacker(DataPacker):
             return "mixed(" + "+".join(sorted(types_found)) + ")"
         return next(iter(types_found))
 
+    @staticmethod
+    def _extract_video_cache_keys(sample: "HFVLMDataPacker.Payload"):
+        """Return stable video identities in processor traversal order.
+
+        Only ordinary string paths are cacheable.  URLs, in-memory videos,
+        frame lists, or malformed conversations deliberately return ``None``
+        so the model takes its native uncached path.
+        """
+        messages = sample.get("messages") if isinstance(sample, dict) else sample
+        if not isinstance(messages, list):
+            return None
+
+        keys = []
+        for message in messages:
+            if not isinstance(message, dict) and hasattr(message, "model_dump"):
+                message = message.model_dump()
+            if not isinstance(message, dict):
+                return None
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                if "video" not in item and item.get("type") != "video":
+                    continue
+                value = item.get("video")
+                if not isinstance(value, str) or "://" in value:
+                    return None
+                keys.append(os.path.realpath(os.path.expanduser(value)))
+        return keys or None
+
     def sft_process_sample(self, sample: "HFVLMDataPacker.Payload") -> Dict[str, Any]:
         """
         Accepts either raw text or conversation format.
         """
+        tao_video_cache_keys = self._extract_video_cache_keys(sample)
         result = self.get_policy_input(sample, add_generation_prompt=False)
+
+        video_grid_thw = result.get("video_grid_thw")
+        if (
+            tao_video_cache_keys is not None
+            and video_grid_thw is not None
+            and len(tao_video_cache_keys) == int(video_grid_thw.shape[0])
+        ):
+            result["tao_video_cache_keys"] = tao_video_cache_keys
 
         max_len = getattr(self.config.policy, "model_max_length", None)
         if max_len is not None and len(result["input_ids"]) > max_len:
