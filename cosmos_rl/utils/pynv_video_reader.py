@@ -17,14 +17,31 @@ from typing import Any
 from cosmos_rl.utils.video_pixel_bounds import normalize_video_pixel_bounds
 
 
+def _is_pynv_exception(error: BaseException) -> bool:
+    """Return whether an exception originated in PyNvVideoCodec native code."""
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if any(
+            "pynvvc" in cls.__name__.lower() for cls in type(current).__mro__
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 def _is_nvdec_capability_error(error: BaseException) -> bool:
-    """Return whether an exception reports a permanent NVDEC limitation.
+    """Return whether an exception reports a permanent GPU-reader limitation.
 
     PyNvVideoCodec exposes unsupported stream/GPU combinations through a
-    dedicated exception type.  Keep a message check for wrapper releases that
-    preserve the native error text while translating the Python exception.
-    Do not classify ordinary decode, I/O, or programming errors as capability
-    misses: those must keep failing the strict fast profile.
+    dedicated exception type.  Its FFmpeg demuxer also reports a stable seek
+    error when a stream has no usable random-access index; uniform frame
+    sampling cannot proceed through PyNv on such a stream.  Keep narrow message
+    checks for wrapper releases that preserve those native errors while
+    translating the Python exception.  Do not classify ordinary decode, I/O,
+    or programming errors as capability misses: those must keep failing the
+    strict fast profile.
     """
     seen: set[int] = set()
     current: BaseException | None = error
@@ -39,6 +56,10 @@ def _is_nvdec_capability_error(error: BaseException) -> bool:
             "error code : 801" in message
             or "not supported on this gpu" in message
             or "unsupported" in message
+            or (
+                "seek target index is out of range" in message
+                and "no matching index entry" in message
+            )
         ):
             return True
         current = current.__cause__ or current.__context__
@@ -381,7 +402,20 @@ def register_pynv_video_reader(
                     .tolist()
                 )
                 try:
-                    batch_frames = decoder.get_batch_frames_by_index(indices)
+                    try:
+                        batch_frames = decoder.get_batch_frames_by_index(indices)
+                    except Exception as batch_error:
+                        # At this boundary, a native PyNv exception means the
+                        # stream cannot satisfy random-access batch retrieval.
+                        # Route only that stream through the existing sparse
+                        # software reader. Other exception types retain the
+                        # scanned NVDEC recovery path below.
+                        if _is_pynv_exception(batch_error):
+                            discard_active_decoder()
+                            return read_video_capability_fallback(
+                                element, video_path, batch_error
+                            )
+                        raise
                     if len(batch_frames) != len(indices):
                         raise RuntimeError(
                             f"NVDEC batch returned {len(batch_frames)} of {len(indices)} frames"

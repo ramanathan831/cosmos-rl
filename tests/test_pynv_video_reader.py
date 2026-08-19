@@ -421,6 +421,53 @@ def test_gpu_reader_falls_back_only_for_nvdec_capability_errors(
     assert "reason=cached_capability" in output
 
 
+def test_gpu_reader_bounds_native_batch_failure_to_stream_fallback(
+    tmp_path, monkeypatch, capsys
+):
+    unseekable = tmp_path / "unseekable.mp4"
+    unseekable.write_bytes(b"video")
+    decoder_calls = []
+
+    class PyNvVCException(Exception):
+        pass
+
+    PyNvVCException.__module__ = "_PyNvVideoCodec"
+
+    class Decoder:
+        def __init__(self, path, **_kwargs):
+            decoder_calls.append(str(path))
+
+        def get_stream_metadata(self):
+            return SimpleNamespace(average_fps=30.0)
+
+        def __len__(self):
+            return 8
+
+        def get_batch_frames_by_index(self, _indices):
+            raise PyNvVCException(
+                "Seek target index is out of range; no matching index entry"
+            )
+
+        def stop(self):
+            return None
+
+    vision = _install_fake_runtime(monkeypatch, Decoder)
+    register_pynv_video_reader(cache_size=0, strict=True)
+    reader = vision.VIDEO_READER_BACKENDS["pynvvideocodec"]
+
+    frames, metadata, _sample_fps = reader(
+        {"video": str(unseekable), "nframes": 8}
+    )
+
+    assert tuple(frames.shape) == (8, 3, 2, 2)
+    assert metadata["video_backend"] == "tao_system_pyav_sparse"
+    assert decoder_calls == [str(unseekable)]
+    assert vision.software_reads == [str(unseekable)]
+    output = capsys.readouterr().out
+    assert output.count("TAO_VIDEO_DECODER_CAPABILITY_FALLBACK_ATTESTATION") == 1
+    assert "reason=PyNvVCException" in output
+
+
 def test_gpu_reader_rejects_unknown_frame_transfer(monkeypatch):
     monkeypatch.setenv("TAO_PYNV_FRAME_TRANSFER", "unknown")
     with pytest.raises(ValueError, match="host_rgb or device_rgbp"):
