@@ -421,10 +421,10 @@ def test_gpu_reader_falls_back_only_for_nvdec_capability_errors(
     assert "reason=cached_capability" in output
 
 
-def test_gpu_reader_bounds_native_batch_failure_to_stream_fallback(
+def test_gpu_reader_falls_back_for_missing_random_access_index(
     tmp_path, monkeypatch, capsys
 ):
-    unseekable = tmp_path / "unseekable.mp4"
+    unseekable = tmp_path / "fragmented.mp4"
     unseekable.write_bytes(b"video")
     decoder_calls = []
 
@@ -441,11 +441,12 @@ def test_gpu_reader_bounds_native_batch_failure_to_stream_fallback(
             return SimpleNamespace(average_fps=30.0)
 
         def __len__(self):
-            return 8
+            return 387
 
         def get_batch_frames_by_index(self, _indices):
             raise PyNvVCException(
-                "Seek target index is out of range; no matching index entry"
+                "Seek : Error code : 1 Error Type : Seek target index is out "
+                "of range (no matching index entry)."
             )
 
         def stop(self):
@@ -455,17 +456,65 @@ def test_gpu_reader_bounds_native_batch_failure_to_stream_fallback(
     register_pynv_video_reader(cache_size=0, strict=True)
     reader = vision.VIDEO_READER_BACKENDS["pynvvideocodec"]
 
-    frames, metadata, _sample_fps = reader(
+    first, metadata, _sample_fps = reader(
         {"video": str(unseekable), "nframes": 8}
     )
+    second, _, _ = reader({"video": str(unseekable), "nframes": 8})
 
-    assert tuple(frames.shape) == (8, 3, 2, 2)
+    assert tuple(first.shape) == tuple(second.shape) == (8, 3, 2, 2)
     assert metadata["video_backend"] == "tao_system_pyav_sparse"
     assert decoder_calls == [str(unseekable)]
-    assert vision.software_reads == [str(unseekable)]
+    assert vision.software_reads == [str(unseekable), str(unseekable)]
     output = capsys.readouterr().out
     assert output.count("TAO_VIDEO_DECODER_CAPABILITY_FALLBACK_ATTESTATION") == 1
     assert "reason=PyNvVCException" in output
+    assert "reason=cached_capability" in output
+
+
+def test_gpu_reader_falls_back_for_native_random_access_batch_error(
+    tmp_path, monkeypatch, capsys
+):
+    video = tmp_path / "native-batch-error.mp4"
+    video.write_bytes(b"video")
+    decoder_options = []
+
+    class PyNvVCException(Exception):
+        pass
+
+    PyNvVCException.__module__ = "_PyNvVideoCodec"
+
+    class Decoder:
+        def __init__(self, _path, **kwargs):
+            decoder_options.append(kwargs)
+
+        def get_stream_metadata(self):
+            return SimpleNamespace(average_fps=30.0)
+
+        def __len__(self):
+            return 8
+
+        def get_batch_frames_by_index(self, _indices):
+            raise PyNvVCException("native random-access batch failed")
+
+        def stop(self):
+            return None
+
+    vision = _install_fake_runtime(monkeypatch, Decoder)
+    register_pynv_video_reader(cache_size=0, strict=True)
+    reader = vision.VIDEO_READER_BACKENDS["pynvvideocodec"]
+
+    first, metadata, _sample_fps = reader({"video": str(video), "nframes": 8})
+    second, _, _ = reader({"video": str(video), "nframes": 8})
+
+    assert tuple(first.shape) == tuple(second.shape) == (8, 3, 2, 2)
+    assert metadata["video_backend"] == "tao_system_pyav_sparse"
+    assert len(decoder_options) == 1
+    assert decoder_options[0]["need_scanned_stream_metadata"] is False
+    assert vision.software_reads == [str(video), str(video)]
+    output = capsys.readouterr().out
+    assert "TAO_GPU_VIDEO_BATCH_RETRY" not in output
+    assert "reason=PyNvVCException" in output
+    assert "reason=cached_capability" in output
 
 
 def test_gpu_reader_rejects_unknown_frame_transfer(monkeypatch):
