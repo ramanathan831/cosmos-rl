@@ -847,6 +847,18 @@ class TrainingConfig(BaseModel):
     optm_grad_norm_clip: float = Field(
         default=1.0, description="Gradient norm clip for optimizer"
     )
+    optm_grad_spike_skip: float = Field(
+        default=0.0,
+        description=(
+            "Skip the optimizer update when the pre-clip gradient norm is "
+            "non-finite or exceeds this value. Gradient clipping bounds how far "
+            "one step can move the parameters, but AdamW still folds an "
+            "anomalous gradient DIRECTION into its m/v moments, after which its "
+            "scale-invariant updates can walk the model off. Skipping leaves "
+            "parameters and both moments untouched and only advances the LR "
+            "schedule. 0 disables the guard (default)."
+        ),
+    )
 
     # --------- EMA ---------
     ema_enable: bool = Field(

@@ -144,12 +144,32 @@ def _linear_qwen3_vl_patch_embed_forward(self, hidden_states):
 _linear_qwen3_vl_patch_embed_forward._tao_channels_last_3d = True
 
 
+# Compute capabilities whose shipped cuDNN has no usable Conv3d engine for the
+# Qwen3-VL vision PatchEmbed, so ``auto`` selects the linear-equivalent path.
+#   (8, 0)  -- A100
+#   >= (10, 0) -- Blackwell datacenter parts (GB200/GB300); without this a plain
+#                 forward dies with "GET was unable to find an engine to execute
+#                 this computation".
+_AUTO_LINEAR_PATCH_EMBED_CAPABILITIES = frozenset({(8, 0)})
+_AUTO_LINEAR_PATCH_EMBED_MIN_MAJOR = 10
+
+
+def _auto_prefers_linear_patch_embed(device_capability) -> bool:
+    if device_capability is None:
+        return False
+    if tuple(device_capability) in _AUTO_LINEAR_PATCH_EMBED_CAPABILITIES:
+        return True
+    return int(device_capability[0]) >= _AUTO_LINEAR_PATCH_EMBED_MIN_MAJOR
+
+
 def apply_qwen3_vl_patch_embed_compat(model: Any, mode: str, device_capability=None) -> bool:
     if mode not in {"auto", "linear", "conv3d"}:
         raise ValueError(f"Unsupported Qwen3-VL patch-embed mode: {mode!r}")
     if device_capability is None and torch.cuda.is_available():
         device_capability = torch.cuda.get_device_capability()
-    enabled = mode == "linear" or (mode == "auto" and device_capability == (8, 0))
+    enabled = mode == "linear" or (
+        mode == "auto" and _auto_prefers_linear_patch_embed(device_capability)
+    )
     if not enabled:
         return False
     patched = 0

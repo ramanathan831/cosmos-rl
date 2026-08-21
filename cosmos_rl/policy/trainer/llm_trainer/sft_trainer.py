@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import os
+import math
 import torch
 import numpy as np
 import torch.distributed as dist
@@ -652,7 +653,28 @@ class SFTTrainer(LLMTrainer):
             return_norm_only=(self.config.train.optm_grad_norm_clip <= 0.0),
         )
 
-        self.optimizers.step()
+        spike_threshold = float(self.config.train.optm_grad_spike_skip or 0.0)
+        skip_update = False
+        if spike_threshold > 0.0:
+            try:
+                observed_norm = float(grad_norm)
+            except (TypeError, ValueError):
+                observed_norm = 0.0
+            skip_update = not math.isfinite(observed_norm) or (
+                observed_norm > spike_threshold
+            )
+        if skip_update:
+            self._grad_spikes_skipped = getattr(self, "_grad_spikes_skipped", 0) + 1
+            logger.warning(
+                f"[Policy] Skipping optimizer update at step {train_step}: "
+                f"pre-clip gradient norm {observed_norm:.4f} exceeds "
+                f"train.optm_grad_spike_skip={spike_threshold:.4f} "
+                f"(total skipped: {self._grad_spikes_skipped}). Parameters and "
+                f"optimizer moments are left untouched."
+            )
+            self.optimizers.zero_grad()
+        else:
+            self.optimizers.step()
         self.lr_schedulers.step()
 
         if self.parallel_dims.pp_enabled:
