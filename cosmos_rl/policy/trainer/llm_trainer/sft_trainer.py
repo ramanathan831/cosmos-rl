@@ -14,13 +14,15 @@
 # limitations under the License.
 
 import os
+import collections
+import statistics
 import math
 import torch
 import numpy as np
 import torch.distributed as dist
 from collections import OrderedDict
 from functools import partial
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from cosmos_rl.utils.parallelism import (
     ParallelDims,
 )
@@ -314,6 +316,177 @@ class SFTTrainer(LLMTrainer):
             self.config.train.train_policy.enable_dp_load_balancing
         )
         self._visual_gradient_contract_checked = False
+
+    # --------- loss-spike rollback ---------
+    # Baseline is the MEDIAN of recent healthy step losses, not an exponential
+    # mean: a median ignores the rising edge of a divergence, whereas an EMA
+    # absorbs it and quietly raises its own alarm threshold. The arming window is
+    # deliberately short because observed spikes can land inside the first ~30
+    # steps, and the consecutive cap stops us fighting an unrecoverable state
+    # forever.
+    _LOSS_SPIKE_WINDOW = 50
+    _LOSS_SPIKE_MIN_OBSERVATIONS = 12
+    _LOSS_SPIKE_MAX_CONSECUTIVE = 8
+    # The pre-clip gradient norm separates a damaging step from a merely noisy
+    # one far better than the loss does. Measured on a healthy run: the loss
+    # tops out at 5.8x its median while a spike reaches 16.2x (1.7x apart),
+    # whereas the gradient norm tops out at 6.9x its median while the spike
+    # reaches 72.5x (10x apart). Both are compared against a rolling median.
+    _SPIKE_GRAD_NORM_FACTOR = 10.0
+    # The loss only blows up one step AFTER the update that caused it, and the
+    # gradient norm ramps for a few steps before the peak, so restoring a single
+    # step is not enough -- keep a ring and rewind past the whole ramp.
+    _SPIKE_ROLLBACK_DEPTH = 4
+    # Restoring the pre-spike state is not enough on its own: the same learning
+    # rate and optimizer state then re-enter the same unstable region and spike
+    # again (observed 3-5 rollbacks per run). Back the step size off on each
+    # rollback and let it climb back to the scheduled value over ~35 healthy
+    # steps, so the nominal schedule is unchanged in steady state.
+    _LOSS_SPIKE_LR_BACKOFF = 0.5
+    _LOSS_SPIKE_LR_RECOVERY = 1.02
+    _LOSS_SPIKE_LR_MIN_SCALE = 0.1
+
+    def _loss_spike_lr_scale(self) -> float:
+        return float(getattr(self, "_loss_spike_lr_scale_value", 1.0))
+
+    def _apply_loss_spike_lr_scale(self) -> None:
+        """Scale the scheduled LR for the coming step.
+
+        The scheduler rewrites ``group["lr"]`` from its base value every step, so
+        applying the factor after ``lr_schedulers.step()`` scales exactly one step
+        and never compounds.
+        """
+        scale = self._loss_spike_lr_scale()
+        if scale >= 1.0:
+            return
+        for optimizer in self.optimizers:
+            for group in optimizer.param_groups:
+                group["lr"] = group["lr"] * scale
+
+    def _loss_spike_trainable_params(self) -> List[torch.Tensor]:
+        return [
+            p
+            for model_part in self.model_parts
+            if model_part is not None
+            for p in model_part.parameters()
+            if p.requires_grad
+        ]
+
+    def _capture_loss_spike_snapshot(self) -> None:
+        """Clone trainable parameters and optimizer moments before an update.
+
+        LoRA keeps this cheap: the trainable set is a few tens of millions of
+        parameters, so the clone costs a few milliseconds against a step time
+        measured in seconds.
+        """
+        with torch.no_grad():
+            params = [p.detach().clone() for p in self._loss_spike_trainable_params()]
+            optimizer_snapshot = []
+            for optimizer in self.optimizers:
+                entries = []
+                for group in optimizer.param_groups:
+                    for p in group["params"]:
+                        state = optimizer.state.get(p)
+                        if not state:
+                            entries.append(None)
+                            continue
+                        entries.append(
+                            {
+                                key: (
+                                    value.detach().clone()
+                                    if torch.is_tensor(value)
+                                    else value
+                                )
+                                for key, value in state.items()
+                            }
+                        )
+                optimizer_snapshot.append(entries)
+            ring = getattr(self, "_loss_spike_ring", None)
+            if ring is None:
+                ring = collections.deque(maxlen=self._SPIKE_ROLLBACK_DEPTH)
+                self._loss_spike_ring = ring
+            ring.append((params, optimizer_snapshot))
+
+    def _restore_loss_spike_snapshot(self) -> bool:
+        ring = getattr(self, "_loss_spike_ring", None)
+        if not ring:
+            return False
+        # Oldest retained state: far enough back to precede the ramp that led in.
+        params, optimizer_snapshot = ring[0]
+        self._loss_spike_rewound_steps = len(ring)
+        with torch.no_grad():
+            for param, saved in zip(self._loss_spike_trainable_params(), params):
+                param.copy_(saved)
+            for optimizer, entries in zip(self.optimizers, optimizer_snapshot):
+                index = 0
+                for group in optimizer.param_groups:
+                    for p in group["params"]:
+                        saved_state = entries[index] if index < len(entries) else None
+                        index += 1
+                        if saved_state is None:
+                            optimizer.state.pop(p, None)
+                            continue
+                        state = optimizer.state.setdefault(p, {})
+                        state.clear()
+                        for key, value in saved_state.items():
+                            state[key] = (
+                                value.detach().clone()
+                                if torch.is_tensor(value)
+                                else value
+                            )
+        # The retained states all precede the spike; drop them so the next
+        # rollback cannot rewind to a state we have already rejected.
+        ring.clear()
+        return True
+
+    def _spike_median(self, attribute: str) -> Optional[float]:
+        window = getattr(self, attribute, None)
+        if not window or len(window) < self._LOSS_SPIKE_MIN_OBSERVATIONS:
+            return None
+        return statistics.median(window)
+
+    def _loss_spike_baseline(self) -> Optional[float]:
+        return self._spike_median("_loss_spike_history")
+
+    def _grad_norm_baseline(self) -> Optional[float]:
+        return self._spike_median("_grad_norm_history")
+
+    def _loss_spike_should_rollback(
+        self, step_loss: float, grad_norm_value: float, factor: float
+    ) -> Tuple[bool, str]:
+        if not math.isfinite(step_loss) or not math.isfinite(grad_norm_value):
+            return True, "non-finite loss or gradient norm"
+        grad_baseline = self._grad_norm_baseline()
+        if grad_baseline is not None:
+            limit = self._SPIKE_GRAD_NORM_FACTOR * max(grad_baseline, 1e-6)
+            if grad_norm_value > limit:
+                return True, (
+                    f"gradient norm {grad_norm_value:.4f} exceeds "
+                    f"{self._SPIKE_GRAD_NORM_FACTOR:.1f}x its rolling median "
+                    f"{grad_baseline:.4f}"
+                )
+        loss_baseline = self._loss_spike_baseline()
+        if loss_baseline is not None and step_loss > factor * max(loss_baseline, 1e-6):
+            return True, (
+                f"loss {step_loss:.4f} exceeds {factor:.1f}x its rolling median "
+                f"{loss_baseline:.4f}"
+            )
+        return False, ""
+
+    def _observe_loss_spike_baseline(
+        self, step_loss: float, grad_norm_value: float
+    ) -> None:
+        for attribute, value in (
+            ("_loss_spike_history", step_loss),
+            ("_grad_norm_history", grad_norm_value),
+        ):
+            if not math.isfinite(value):
+                continue
+            window = getattr(self, attribute, None)
+            if window is None:
+                window = collections.deque(maxlen=self._LOSS_SPIKE_WINDOW)
+                setattr(self, attribute, window)
+            window.append(value)
 
     def step_training(
         self,
@@ -653,29 +826,72 @@ class SFTTrainer(LLMTrainer):
             return_norm_only=(self.config.train.optm_grad_norm_clip <= 0.0),
         )
 
-        spike_threshold = float(self.config.train.optm_grad_spike_skip or 0.0)
-        skip_update = False
-        if spike_threshold > 0.0:
+        rollback_factor = float(self.config.train.optm_loss_spike_rollback or 0.0)
+        rolled_back = False
+        step_loss = float("nan")
+        if rollback_factor > 0.0:
+            denominator = int(token_loss_denominator.item())
+            if denominator > 0:
+                step_loss = float(token_loss_numerator.item()) / denominator
             try:
-                observed_norm = float(grad_norm)
+                grad_norm_value = float(grad_norm)
             except (TypeError, ValueError):
-                observed_norm = 0.0
-            skip_update = not math.isfinite(observed_norm) or (
-                observed_norm > spike_threshold
+                grad_norm_value = float("nan")
+            rolled_back, spike_reason = self._loss_spike_should_rollback(
+                step_loss, grad_norm_value, rollback_factor
             )
-        if skip_update:
-            self._grad_spikes_skipped = getattr(self, "_grad_spikes_skipped", 0) + 1
+
+        if rolled_back:
+            self._loss_spike_rollbacks = getattr(self, "_loss_spike_rollbacks", 0) + 1
+            consecutive = getattr(self, "_loss_spike_consecutive", 0) + 1
+            self._loss_spike_consecutive = consecutive
+            restored = self._restore_loss_spike_snapshot()
             logger.warning(
-                f"[Policy] Skipping optimizer update at step {train_step}: "
-                f"pre-clip gradient norm {observed_norm:.4f} exceeds "
-                f"train.optm_grad_spike_skip={spike_threshold:.4f} "
-                f"(total skipped: {self._grad_spikes_skipped}). Parameters and "
-                f"optimizer moments are left untouched."
+                # ``train_step`` is pre-increment here while the worker's
+                # "Step: N/M" line is post-increment, so report N to match it.
+                f"[Policy] Training spike at step {train_step + 1}: {spike_reason}. "
+                + (
+                    f"Rewound {getattr(self, '_loss_spike_rewound_steps', 0)} step(s) "
+                    f"of parameters and optimizer moments"
+                    if restored
+                    else "No snapshot available, update skipped"
+                )
+                + f" (rollbacks: {self._loss_spike_rollbacks}, consecutive: "
+                f"{consecutive})."
             )
             self.optimizers.zero_grad()
+            self._loss_spike_lr_scale_value = max(
+                self._LOSS_SPIKE_LR_MIN_SCALE,
+                self._loss_spike_lr_scale() * self._LOSS_SPIKE_LR_BACKOFF,
+            )
+            logger.warning(
+                f"[Policy] Step-size backoff after rollback: scheduled LR will be "
+                f"scaled by {self._loss_spike_lr_scale_value:.4f} and recover "
+                f"toward 1.0 over subsequent healthy steps."
+            )
+            if consecutive >= self._LOSS_SPIKE_MAX_CONSECUTIVE:
+                logger.warning(
+                    f"[Policy] {consecutive} consecutive rollbacks at step "
+                    f"{train_step + 1}; the run is not recovering from this state, so "
+                    f"normal updates resume and the loss baseline is re-seeded "
+                    f"rather than stalling training indefinitely."
+                )
+                self._loss_spike_consecutive = 0
+                self._loss_spike_history = None
+                self._grad_norm_history = None
         else:
+            if rollback_factor > 0.0:
+                self._loss_spike_consecutive = 0
+                self._capture_loss_spike_snapshot()
+                self._loss_spike_lr_scale_value = min(
+                    1.0, self._loss_spike_lr_scale() * self._LOSS_SPIKE_LR_RECOVERY
+                )
             self.optimizers.step()
         self.lr_schedulers.step()
+        if rollback_factor > 0.0:
+            self._apply_loss_spike_lr_scale()
+        if rollback_factor > 0.0 and not rolled_back:
+            self._observe_loss_spike_baseline(step_loss, grad_norm_value)
 
         if self.parallel_dims.pp_enabled:
             report_data = {}

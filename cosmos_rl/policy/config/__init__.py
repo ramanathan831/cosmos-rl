@@ -847,16 +847,21 @@ class TrainingConfig(BaseModel):
     optm_grad_norm_clip: float = Field(
         default=1.0, description="Gradient norm clip for optimizer"
     )
-    optm_grad_spike_skip: float = Field(
+    optm_loss_spike_rollback: float = Field(
         default=0.0,
         description=(
-            "Skip the optimizer update when the pre-clip gradient norm is "
-            "non-finite or exceeds this value. Gradient clipping bounds how far "
-            "one step can move the parameters, but AdamW still folds an "
-            "anomalous gradient DIRECTION into its m/v moments, after which its "
-            "scale-invariant updates can walk the model off. Skipping leaves "
-            "parameters and both moments untouched and only advances the LR "
-            "schedule. 0 disables the guard (default)."
+            "Roll back to the last healthy step when the token-weighted training "
+            "loss exceeds this multiple of its running mean (or is non-finite). "
+            "Restores trainable parameters AND optimizer moments, so the update "
+            "that damaged the model is undone rather than merely skipped. "
+            "Thresholding the gradient norm instead does not work here: AdamW's "
+            "m/sqrt(v) is scale-invariant, so a damaging update looks "
+            "normal-sized and the large gradient only appears one step later, "
+            "after the damage. 0 disables the guard (default). "
+            "MEMORY: rewinding retains four snapshots of every trainable "
+            "parameter plus its AdamW moments. That is ~1.2GB for a 30M-param "
+            "LoRA adapter but ~350GB for a dense 8.8B model, so enable this for "
+            "PEFT runs and leave it off for dense training."
         ),
     )
 
