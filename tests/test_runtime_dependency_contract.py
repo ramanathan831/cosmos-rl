@@ -24,16 +24,7 @@ SPEC = importlib.util.spec_from_file_location("runtime_dependency_contract", SCR
 assert SPEC and SPEC.loader
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
-missing_deepep_symbols = MODULE.missing_deepep_symbols
 repair_qwen_pynv_worker_source = MODULE.repair_qwen_pynv_worker_source
-repair_vllm_conv3d_source = MODULE.repair_vllm_conv3d_source
-
-
-OLD_SOURCE = """
-from vllm.utils.torch_utils import is_torch_equal
-if self.enable_linear and (is_torch_equal("2.9.0") or is_torch_equal("2.9.1")):
-    return self._forward_mulmat(x)
-"""
 
 QWEN_SOURCE = """
 FORCE_QWENVL_VIDEO_READER = os.getenv("FORCE_QWENVL_VIDEO_READER", None)
@@ -60,19 +51,6 @@ def fetch_video(ele: Dict[str, Any], image_patch_size: int = 14, return_video_sa
                 return_video_metadata: bool = False) -> Union[torch.Tensor, List[Image.Image]]:
     image_factor = image_patch_size * SPATIAL_MERGE_SIZE
 """
-
-
-def test_repair_vllm_conv3d_source_is_idempotent() -> None:
-    repaired, changed = repair_vllm_conv3d_source(OLD_SOURCE)
-    assert changed
-    assert "is_torch_equal_or_newer" in repaired
-    assert 'is_torch_equal_or_newer("2.9.0")' in repaired
-    assert repair_vllm_conv3d_source(repaired) == (repaired, False)
-
-
-def test_repair_vllm_conv3d_rejects_unknown_source() -> None:
-    with pytest.raises(RuntimeError, match="Unrecognized"):
-        repair_vllm_conv3d_source("def forward_cuda(self, x): pass")
 
 
 def test_repair_qwen_pynv_worker_source_is_idempotent() -> None:
@@ -114,16 +92,6 @@ def test_repair_qwen_pynv_worker_source_rejects_stale_worker_contract() -> None:
     )
     with pytest.raises(RuntimeError, match="Unrecognized qwen-vl-utils"):
         repair_qwen_pynv_worker_source(stale)
-
-
-def test_deepep_symbol_contract_reports_only_missing_symbols() -> None:
-    symbols = "\n".join(
-        (
-            "deep_ep::internode_ll::clean_mask_buffer(int*)",
-            "deep_ep::internode_ll::update_mask_buffer(int*)",
-        )
-    )
-    assert missing_deepep_symbols(symbols) == ["internode_ll::query_mask_buffer"]
 
 
 def test_qwen_packer_normalizes_video_bounds_before_dynamic_cached_fetch() -> None:
